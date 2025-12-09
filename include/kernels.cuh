@@ -193,7 +193,7 @@ __global__ void computeMeasurementFunctionKernel(
     const BranchEnd* __restrict__ branch_end,
     const Real* __restrict__ pt_ratio,
     const Real* __restrict__ ct_ratio,
-    const bool* __restrict__ is_active,
+    const uint8_t* __restrict__ is_active,
     const Real* __restrict__ v_mag,
     const Real* __restrict__ v_angle,
     const Real* __restrict__ p_inj,
@@ -223,7 +223,7 @@ __global__ void computeResidualsKernel(
     Real* __restrict__ residuals,
     const Real* __restrict__ z_measured,
     const Real* __restrict__ h_estimated,
-    const bool* __restrict__ is_active,
+    const uint8_t* __restrict__ is_active,
     int32_t n_meas);
 
 /**
@@ -241,7 +241,7 @@ __global__ void computeObjectiveFunctionKernel(
     Real* __restrict__ partial_sums,
     const Real* __restrict__ residuals,
     const Real* __restrict__ weights,
-    const bool* __restrict__ is_active,
+    const uint8_t* __restrict__ is_active,
     int32_t n_meas);
 
 /**
@@ -259,7 +259,7 @@ __global__ void findLargestResidualKernel(
     Real* __restrict__ max_residual,
     int32_t* __restrict__ max_index,
     const Real* __restrict__ residuals,
-    const bool* __restrict__ is_active,
+    const uint8_t* __restrict__ is_active,
     int32_t n_meas);
 
 //=============================================================================
@@ -289,7 +289,7 @@ __global__ void computeHuberWeightsKernel(
     const Real* __restrict__ residuals,
     const Real* __restrict__ sigma,
     Real gamma,
-    const bool* __restrict__ is_active,
+    const uint8_t* __restrict__ is_active,
     int32_t n_meas);
 
 /**
@@ -311,7 +311,7 @@ __global__ void computeHuberObjectiveKernel(
     const Real* __restrict__ residuals,
     const Real* __restrict__ sigma,
     Real gamma,
-    const bool* __restrict__ is_active,
+    const uint8_t* __restrict__ is_active,
     int32_t n_meas);
 
 //=============================================================================

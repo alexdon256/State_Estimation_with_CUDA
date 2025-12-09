@@ -1072,13 +1072,14 @@ int32_t applyIterativeRefinement(
         cusparseDestroyDnVec(vecR);
         
         // Check residual norm for early termination
-        // Compute ||r||_2^2 = sum(r_i^2) using Thrust, then take sqrt
+        // Compute ||r||_2^2 = sum(r_i^2) using Thrust transform_reduce
         thrust::device_ptr<Real> r_ptr(d_r);
-        Real r_norm_sq = thrust::inner_product(
+        Real r_norm_sq = thrust::transform_reduce(
             thrust::cuda::par.on(stream),
             r_ptr, r_ptr + n,
-            r_ptr,
-            0.0f);
+            [] __host__ __device__ (Real x) { return x * x; },
+            0.0f,
+            thrust::plus<Real>());
         
         Real r_norm = sqrtf(r_norm_sq);
         
