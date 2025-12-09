@@ -502,14 +502,95 @@ cudaError_t OptimizedCholeskySolver::solveMultiple(
         return cudaErrorNotReady;
     }
     
-    // Solve each RHS sequentially
-    // TODO: Implement batch solve for better performance
-    for (int32_t i = 0; i < nrhs; ++i) {
-        const Real* d_bi = d_B + i * current_n_;
-        Real* d_xi = d_X + i * current_n_;
+    // For small number of RHS or small systems, sequential is efficient
+    // For larger problems, we use batched approach with streams
+    constexpr int32_t BATCH_THRESHOLD_NRHS = 4;
+    constexpr int32_t BATCH_THRESHOLD_N = 1000;
+    
+    if (nrhs < BATCH_THRESHOLD_NRHS || current_n_ < BATCH_THRESHOLD_N) {
+        // Sequential solve - simple and efficient for small problems
+        for (int32_t i = 0; i < nrhs; ++i) {
+            const Real* d_bi = d_B + i * current_n_;
+            Real* d_xi = d_X + i * current_n_;
+            
+            cudaError_t err = solve(d_bi, d_xi);
+            if (err != cudaSuccess) return err;
+        }
+    } else {
+        // Batched solve using multiple streams for better GPU utilization
+        constexpr int32_t MAX_CONCURRENT = 4;
+        int32_t num_streams = std::min(nrhs, MAX_CONCURRENT);
         
-        cudaError_t err = solve(d_bi, d_xi);
-        if (err != cudaSuccess) return err;
+        // Create temporary streams for parallel execution
+        std::vector<cudaStream_t> streams(num_streams);
+        for (int32_t s = 0; s < num_streams; ++s) {
+            cudaStreamCreate(&streams[s]);
+        }
+        
+        // Allocate temporary buffers for each stream
+        std::vector<Real*> d_temp_buffers(num_streams);
+        for (int32_t s = 0; s < num_streams; ++s) {
+            cudaMalloc(&d_temp_buffers[s], current_n_ * sizeof(Real));
+        }
+        
+        // Process RHS in batches across streams
+        cudaError_t last_err = cudaSuccess;
+        for (int32_t i = 0; i < nrhs; ++i) {
+            int32_t stream_idx = i % num_streams;
+            cudaStream_t curr_stream = streams[stream_idx];
+            
+            const Real* d_bi = d_B + i * current_n_;
+            Real* d_xi = d_X + i * current_n_;
+            
+            // Apply permutation to RHS
+            dim3 block(BLOCK_SIZE_STANDARD);
+            dim3 grid = compute_grid_size(current_n_, BLOCK_SIZE_STANDARD);
+            
+            applyVectorPermutationKernel<<<grid, block, 0, curr_stream>>>(
+                d_temp_buffers[stream_idx], d_bi, d_perm_, current_n_);
+            
+            // Solve using cuSOLVER (note: cusolverSpScsrlsvchol is not thread-safe
+            // so we synchronize before each solve)
+            cudaStreamSynchronize(curr_stream);
+            
+            int singularity = -1;
+#ifdef SLE_USE_DOUBLE
+            cusolverStatus_t status = cusolverSpDcsrlsvchol(
+                cusolver_handle_, current_n_, current_nnz_, mat_descr_,
+                cached_values_, cached_row_ptr_, cached_col_ind_,
+                d_temp_buffers[stream_idx], config_.singularity_tol, 0,
+                d_xi, &singularity);
+#else
+            cusolverStatus_t status = cusolverSpScsrlsvchol(
+                cusolver_handle_, current_n_, current_nnz_, mat_descr_,
+                cached_values_, cached_row_ptr_, cached_col_ind_,
+                d_temp_buffers[stream_idx], config_.singularity_tol, 0,
+                d_xi, &singularity);
+#endif
+            
+            if (status != CUSOLVER_STATUS_SUCCESS || singularity >= 0) {
+                last_err = cudaErrorUnknown;
+            }
+            
+            // Apply inverse permutation
+            cudaMemcpyAsync(d_temp_buffers[stream_idx], d_xi, 
+                           current_n_ * sizeof(Real), cudaMemcpyDeviceToDevice, curr_stream);
+            applyInverseVectorPermutationKernel<<<grid, block, 0, curr_stream>>>(
+                d_xi, d_temp_buffers[stream_idx], d_perm_inv_, current_n_);
+        }
+        
+        // Synchronize all streams
+        for (int32_t s = 0; s < num_streams; ++s) {
+            cudaStreamSynchronize(streams[s]);
+        }
+        
+        // Cleanup
+        for (int32_t s = 0; s < num_streams; ++s) {
+            cudaFree(d_temp_buffers[s]);
+            cudaStreamDestroy(streams[s]);
+        }
+        
+        if (last_err != cudaSuccess) return last_err;
     }
     
     return cudaSuccess;
@@ -990,8 +1071,23 @@ int32_t applyIterativeRefinement(
         cusparseDestroyDnVec(vecX);
         cusparseDestroyDnVec(vecR);
         
-        // Check residual norm (optional early termination)
-        // TODO: Add norm check
+        // Check residual norm for early termination
+        // Compute ||r||_2^2 = sum(r_i^2) using Thrust, then take sqrt
+        thrust::device_ptr<Real> r_ptr(d_r);
+        Real r_norm_sq = thrust::inner_product(
+            thrust::cuda::par.on(stream),
+            r_ptr, r_ptr + n,
+            r_ptr,
+            0.0f);
+        
+        Real r_norm = sqrtf(r_norm_sq);
+        
+        // Early termination if residual is small enough
+        if (r_norm < config.tolerance) {
+            cudaFree(d_r);
+            cudaFree(d_e);
+            return iter + 1;  // Return number of iterations performed
+        }
         
         // Solve A*e = r
         (void)solver.solve(d_r, d_e);
