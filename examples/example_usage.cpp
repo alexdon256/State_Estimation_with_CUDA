@@ -1,18 +1,25 @@
 /**
  * @file example_usage.cpp
- * @brief Comprehensive SLE Engine usage example (FR-26)
+ * @brief Comprehensive SLE Engine usage example (FR-26) - METER-CENTRIC
  * 
  * Demonstrates the full operational lifecycle of the SLE Engine using the
- * C-compatible DLL API. This example can be compiled as standard C++ without
- * requiring CUDA compilation.
+ * C-compatible DLL API with METER-BASED telemetry. All measurements come
+ * through physical metering devices (voltmeters, multimeters, wattmeters).
+ * 
+ * METER-CENTRIC DESIGN:
+ * - Voltmeters on buses provide voltage measurements
+ * - Multimeters on branches provide P, Q, V, I measurements
+ * - Wattmeters on branches provide P, Q measurements
+ * - All telemetry updates go through sle_UpdateMeterReading()
+ * - Estimated values retrieved via sle_GetMeterEstimate()
  * 
  * Demonstrates:
- * 1. Model Upload & Full Run (FR-12)
- * 2. Telemetry Update & Fast Run (FR-11, FR-16)
+ * 1. Model Upload with Meters (FR-12)
+ * 2. Meter Telemetry Update & Fast Run (FR-11, FR-16)
  * 3. SD Update & Fast Run (FR-05)
  * 4. Structural Update & Full Run (FR-25)
  * 5. Transformer Tap Update (FR-01 controllable taps)
- * 6. Bad Data Detection (FR-15)
+ * 6. Bad Data Detection via Meters (FR-15)
  * 7. Robust Estimation (FR-17)
  * 
  * Compile: cl /EHsc example_usage.cpp /link SLE.lib
@@ -24,7 +31,6 @@
 #include <vector>
 #include <cstdlib>
 #include <cmath>
-#include <cstring>
 
 //=============================================================================
 // Constants and Configuration
@@ -90,22 +96,7 @@ void printVoltages(SLE_Handle engine, int32_t bus_count) {
 }
 
 /**
- * @brief Add noise to measurement values
- */
-void addMeasurementNoise(SLE_Real* values, const SLE_Real* sigmas, 
-                         int32_t count, unsigned int seed) {
-    srand(seed);
-    for (int32_t i = 0; i < count; ++i) {
-        // Simple box-muller transform for Gaussian noise
-        float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
-        float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
-        float noise = sigmas[i] * sqrtf(-2.0f * logf(u1)) * cosf(2.0f * PI * u2);
-        values[i] += noise;
-    }
-}
-
-/**
- * @brief Load IEEE 14-Bus test case data
+ * @brief Load IEEE 14-Bus test case data with METER-BASED measurements
  */
 bool loadIEEE14Bus(SLE_Handle engine) {
     // IEEE 14-Bus System Data
@@ -199,115 +190,112 @@ bool loadIEEE14Bus(SLE_Handle engine) {
         }
     }
     
-    // Measurements: All bus voltages + key power flows
-    // Voltage measurements
+    //=========================================================================
+    // METER-BASED MEASUREMENT SETUP
+    // Meters are the PRIMARY source of telemetry - they own the measurements
+    //=========================================================================
+    
+    // Bus IDs for reference
     const char* bus_ids[] = {
         "Bus1", "Bus2", "Bus3", "Bus4", "Bus5", "Bus6", "Bus7",
         "Bus8", "Bus9", "Bus10", "Bus11", "Bus12", "Bus13", "Bus14"
     };
     
+    //-------------------------------------------------------------------------
+    // 1. VOLTMETERS on all buses - for voltage measurements
+    //    Each voltmeter creates a V_MAG measurement automatically
+    //-------------------------------------------------------------------------
     for (int i = 0; i < 14; ++i) {
-        char meas_id[32];
-        snprintf(meas_id, sizeof(meas_id), "V%d", i + 1);
+        char meter_id[32];
+        snprintf(meter_id, sizeof(meter_id), "VM%d", i + 1);
         
-        SLE_MeasurementInfo info = {};
-        info.id = meas_id;
-        info.type = SLE_MEAS_V_MAG;
-        info.location = bus_ids[i];
-        info.branch_end = SLE_BRANCH_FROM;
-        info.sigma = 0.004f;
-        info.pt_ratio = 1.0f;
-        info.ct_ratio = 1.0f;
-        info.is_pseudo = 0;
+        SLE_MeterInfo meter = {};
+        meter.id = meter_id;
+        meter.type = SLE_METER_VOLTMETER;
+        meter.bus_id = bus_ids[i];
+        meter.branch_id = nullptr;
+        meter.branch_end = SLE_BRANCH_FROM;
+        meter.pt_ratio = 1.0f;
+        meter.ct_ratio = 1.0f;
+        meter.sigma_v = 0.004f;
+        meter.sigma_p = 0.01f;
+        meter.sigma_i = 0.01f;
         
-        if (sle_AddMeasurement(engine, &info) != SLE_OK) {
+        if (sle_AddMeter(engine, &meter) != SLE_OK) {
             return false;
         }
     }
     
-    // P injection measurements at key buses
-    const char* p_inj_buses[] = {"Bus1", "Bus2", "Bus3", "Bus6", "Bus8"};
-    for (int i = 0; i < 5; ++i) {
-        char meas_id[32];
-        snprintf(meas_id, sizeof(meas_id), "P%s", p_inj_buses[i] + 3);  // Skip "Bus"
+    //-------------------------------------------------------------------------
+    // 2. MULTIMETERS on key branches - for P, Q, I, V measurements
+    //    Each multimeter creates P_FLOW, Q_FLOW, I_MAG, V_MAG measurements
+    //-------------------------------------------------------------------------
+    const struct {
+        const char* meter_id;
+        const char* bus_id;     // Bus for voltage reference
+        const char* branch_id;  // Branch for power/current
+    } multimeters[] = {
+        {"MM1-2",  "Bus1", "Line1-2"},
+        {"MM1-5",  "Bus1", "Line1-5"},
+        {"MM2-3",  "Bus2", "Line2-3"},
+        {"MM2-4",  "Bus2", "Line2-4"}
+    };
+    
+    for (const auto& mm : multimeters) {
+        SLE_MeterInfo meter = {};
+        meter.id = mm.meter_id;
+        meter.type = SLE_METER_MULTIMETER;
+        meter.bus_id = mm.bus_id;
+        meter.branch_id = mm.branch_id;
+        meter.branch_end = SLE_BRANCH_FROM;
+        meter.pt_ratio = 1.0f;
+        meter.ct_ratio = 1.0f;
+        meter.sigma_v = 0.004f;
+        meter.sigma_p = 0.008f;
+        meter.sigma_i = 0.01f;
         
-        SLE_MeasurementInfo info = {};
-        info.id = meas_id;
-        info.type = SLE_MEAS_P_INJECTION;
-        info.location = p_inj_buses[i];
-        info.sigma = 0.01f;
-        info.pt_ratio = 1.0f;
-        info.ct_ratio = 1.0f;
-        info.is_pseudo = 0;
-        
-        if (sle_AddMeasurement(engine, &info) != SLE_OK) {
+        if (sle_AddMeter(engine, &meter) != SLE_OK) {
             return false;
         }
     }
     
-    // Q injection measurements
-    const char* q_inj_buses[] = {"Bus1", "Bus2", "Bus6"};
-    for (int i = 0; i < 3; ++i) {
-        char meas_id[32];
-        snprintf(meas_id, sizeof(meas_id), "Q%s", q_inj_buses[i] + 3);
+    //-------------------------------------------------------------------------
+    // 3. WATTMETERS on additional branches - for P, Q measurements only
+    //-------------------------------------------------------------------------
+    const struct {
+        const char* meter_id;
+        const char* bus_id;
+        const char* branch_id;
+    } wattmeters[] = {
+        {"WM2-5",  "Bus2", "Line2-5"},
+        {"WM3-4",  "Bus3", "Line3-4"},
+        {"WM6-11", "Bus6", "Line6-11"},
+        {"WM6-12", "Bus6", "Line6-12"},
+        {"WM6-13", "Bus6", "Line6-13"}
+    };
+    
+    for (const auto& wm : wattmeters) {
+        SLE_MeterInfo meter = {};
+        meter.id = wm.meter_id;
+        meter.type = SLE_METER_WATTMETER;
+        meter.bus_id = wm.bus_id;
+        meter.branch_id = wm.branch_id;
+        meter.branch_end = SLE_BRANCH_FROM;
+        meter.pt_ratio = 1.0f;
+        meter.ct_ratio = 1.0f;
+        meter.sigma_v = 0.004f;
+        meter.sigma_p = 0.01f;
+        meter.sigma_i = 0.01f;
         
-        SLE_MeasurementInfo info = {};
-        info.id = meas_id;
-        info.type = SLE_MEAS_Q_INJECTION;
-        info.location = q_inj_buses[i];
-        info.sigma = 0.01f;
-        info.pt_ratio = 1.0f;
-        info.ct_ratio = 1.0f;
-        info.is_pseudo = 0;
-        
-        if (sle_AddMeasurement(engine, &info) != SLE_OK) {
+        if (sle_AddMeter(engine, &meter) != SLE_OK) {
             return false;
         }
     }
     
-    // P flow measurements on key lines
-    const char* p_flow_branches[] = {"Line1-2", "Line1-5", "Line2-3", "Line2-4"};
-    for (int i = 0; i < 4; ++i) {
-        char meas_id[32];
-        snprintf(meas_id, sizeof(meas_id), "Pf_%s", p_flow_branches[i]);
-        
-        SLE_MeasurementInfo info = {};
-        info.id = meas_id;
-        info.type = SLE_MEAS_P_FLOW;
-        info.location = p_flow_branches[i];
-        info.branch_end = SLE_BRANCH_FROM;
-        info.sigma = 0.008f;
-        info.pt_ratio = 1.0f;
-        info.ct_ratio = 1.0f;
-        info.is_pseudo = 0;
-        
-        if (sle_AddMeasurement(engine, &info) != SLE_OK) {
-            return false;
-        }
-    }
-    
-    // Q flow measurements
-    const char* q_flow_branches[] = {"Line1-2", "Line1-5", "Line2-3"};
-    for (int i = 0; i < 3; ++i) {
-        char meas_id[32];
-        snprintf(meas_id, sizeof(meas_id), "Qf_%s", q_flow_branches[i]);
-        
-        SLE_MeasurementInfo info = {};
-        info.id = meas_id;
-        info.type = SLE_MEAS_Q_FLOW;
-        info.location = q_flow_branches[i];
-        info.branch_end = SLE_BRANCH_FROM;
-        info.sigma = 0.008f;
-        info.pt_ratio = 1.0f;
-        info.ct_ratio = 1.0f;
-        info.is_pseudo = 0;
-        
-        if (sle_AddMeasurement(engine, &info) != SLE_OK) {
-            return false;
-        }
-    }
-    
-    // Pseudo measurements for zero injection bus (Bus 7)
+    //-------------------------------------------------------------------------
+    // 4. Pseudo measurements for zero injection buses (no physical meter)
+    //    These are structural constraints, not actual meters
+    //-------------------------------------------------------------------------
     {
         SLE_MeasurementInfo info = {};
         info.id = "P7_pseudo";
@@ -328,32 +316,102 @@ bool loadIEEE14Bus(SLE_Handle engine) {
 }
 
 /**
- * @brief Get true measurement values from power flow solution
+ * @brief Initialize all meter readings with true power flow values
+ * 
+ * This demonstrates meter-centric telemetry:
+ * - Update voltmeters on buses
+ * - Update multimeters on branches (P, Q, V, I)
+ * - Update wattmeters on branches (P, Q)
  */
-void getIEEE14TrueMeasurements(SLE_Real* voltages, SLE_Real* p_inj, 
-                                SLE_Real* q_inj, SLE_Real* p_flow, SLE_Real* q_flow) {
-    // True power flow solution values
+void initializeMeterReadings(SLE_Handle engine) {
+    // True power flow solution voltages
     const SLE_Real v_true[] = {
         1.060f, 1.045f, 1.010f, 1.018f, 1.020f, 1.070f, 1.062f,
         1.090f, 1.056f, 1.051f, 1.057f, 1.055f, 1.050f, 1.036f
     };
-    memcpy(voltages, v_true, 14 * sizeof(SLE_Real));
     
-    // P injections at Bus1, Bus2, Bus3, Bus6, Bus8
-    const SLE_Real p_true[] = {2.324f, 0.183f, -0.942f, -0.112f, 0.0f};
-    memcpy(p_inj, p_true, 5 * sizeof(SLE_Real));
-    
-    // Q injections at Bus1, Bus2, Bus6
-    const SLE_Real q_true[] = {-0.165f, 0.308f, 0.052f};
-    memcpy(q_inj, q_true, 3 * sizeof(SLE_Real));
-    
-    // P flows on Line1-2, Line1-5, Line2-3, Line2-4
+    // True power flows [p.u.] on branches with multimeters
+    // Line1-2, Line1-5, Line2-3, Line2-4
     const SLE_Real pf_true[] = {1.569f, 0.755f, 0.732f, 0.561f};
-    memcpy(p_flow, pf_true, 4 * sizeof(SLE_Real));
+    const SLE_Real qf_true[] = {-0.204f, 0.039f, 0.035f, 0.028f};
     
-    // Q flows on Line1-2, Line1-5, Line2-3
-    const SLE_Real qf_true[] = {-0.204f, 0.039f, 0.035f};
-    memcpy(q_flow, qf_true, 3 * sizeof(SLE_Real));
+    // True power flows on branches with wattmeters  
+    // Line2-5, Line3-4, Line6-11, Line6-12, Line6-13
+    const SLE_Real wm_p[] = {0.415f, -0.233f, 0.073f, 0.078f, 0.177f};
+    const SLE_Real wm_q[] = {0.012f, 0.045f, 0.035f, 0.025f, 0.072f};
+    
+    //-------------------------------------------------------------------------
+    // 1. Update VOLTMETERS (VM1-VM14) with bus voltage readings
+    //-------------------------------------------------------------------------
+    std::cout << "  Setting voltmeter readings..." << std::endl;
+    for (int i = 0; i < 14; ++i) {
+        char meter_id[32];
+        snprintf(meter_id, sizeof(meter_id), "VM%d", i + 1);
+        sle_UpdateMeterReading(engine, meter_id, "V", v_true[i]);
+    }
+    
+    //-------------------------------------------------------------------------
+    // 2. Update MULTIMETERS with P, Q readings
+    //-------------------------------------------------------------------------
+    std::cout << "  Setting multimeter readings..." << std::endl;
+    const char* mm_ids[] = {"MM1-2", "MM1-5", "MM2-3", "MM2-4"};
+    for (int i = 0; i < 4; ++i) {
+        sle_UpdateMeterReading(engine, mm_ids[i], "kW", pf_true[i]);
+        sle_UpdateMeterReading(engine, mm_ids[i], "kVAR", qf_true[i]);
+    }
+    
+    //-------------------------------------------------------------------------
+    // 3. Update WATTMETERS with P, Q readings
+    //-------------------------------------------------------------------------
+    std::cout << "  Setting wattmeter readings..." << std::endl;
+    const char* wm_ids[] = {"WM2-5", "WM3-4", "WM6-11", "WM6-12", "WM6-13"};
+    for (int i = 0; i < 5; ++i) {
+        sle_UpdateMeterReading(engine, wm_ids[i], "kW", wm_p[i]);
+        sle_UpdateMeterReading(engine, wm_ids[i], "kVAR", wm_q[i]);
+    }
+}
+
+/**
+ * @brief Add measurement noise to meter readings
+ */
+void addMeterNoise(SLE_Handle engine, unsigned int seed) {
+    srand(seed);
+    
+    auto gaussNoise = [](float sigma) -> float {
+        float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
+        return sigma * sqrtf(-2.0f * logf(u1)) * cosf(2.0f * PI * u2);
+    };
+    
+    // Add noise to voltmeters (sigma = 0.004)
+    for (int i = 0; i < 14; ++i) {
+        char meter_id[32];
+        snprintf(meter_id, sizeof(meter_id), "VM%d", i + 1);
+        
+        SLE_Real current_val;
+        sle_GetMeterReading(engine, meter_id, "V", &current_val);
+        sle_UpdateMeterReading(engine, meter_id, "V", current_val + gaussNoise(0.004f));
+    }
+    
+    // Add noise to multimeters (sigma_p = 0.008)
+    const char* mm_ids[] = {"MM1-2", "MM1-5", "MM2-3", "MM2-4"};
+    for (int i = 0; i < 4; ++i) {
+        SLE_Real p_val, q_val;
+        sle_GetMeterReading(engine, mm_ids[i], "kW", &p_val);
+        sle_GetMeterReading(engine, mm_ids[i], "kVAR", &q_val);
+        sle_UpdateMeterReading(engine, mm_ids[i], "kW", p_val + gaussNoise(0.008f));
+        sle_UpdateMeterReading(engine, mm_ids[i], "kVAR", q_val + gaussNoise(0.008f));
+    }
+    
+    // Add noise to wattmeters (sigma_p = 0.01)
+    const char* wm_ids[] = {"WM2-5", "WM3-4", "WM6-11", "WM6-12", "WM6-13"};
+    for (int i = 0; i < 5; ++i) {
+        SLE_Real p_val, q_val;
+        sle_GetMeterReading(engine, wm_ids[i], "kW", &p_val);
+        sle_GetMeterReading(engine, wm_ids[i], "kVAR", &q_val);
+        sle_UpdateMeterReading(engine, wm_ids[i], "kW", p_val + gaussNoise(0.01f));
+        sle_UpdateMeterReading(engine, wm_ids[i], "kVAR", q_val + gaussNoise(0.01f));
+    }
 }
 
 //=============================================================================
@@ -414,7 +472,7 @@ int main() {
     //=========================================================================
     std::cout << "\n>>> Phase 1: Model Upload & Full WLS Run (FR-12)" << std::endl;
     
-    // Load IEEE 14-Bus test case
+    // Load IEEE 14-Bus test case with METER-BASED measurements
     if (!loadIEEE14Bus(engine)) {
         std::cerr << "Failed to load IEEE 14-bus test case!" << std::endl;
         sle_Destroy(engine);
@@ -424,11 +482,13 @@ int main() {
     int32_t bus_count = sle_GetBusCount(engine);
     int32_t branch_count = sle_GetBranchCount(engine);
     int32_t meas_count = sle_GetMeasurementCount(engine);
+    int32_t meter_count = sle_GetMeterCount(engine);
     
-    std::cout << "Network Model:" << std::endl;
+    std::cout << "Network Model (Meter-Centric):" << std::endl;
     std::cout << "  Buses:        " << bus_count << std::endl;
     std::cout << "  Branches:     " << branch_count << std::endl;
-    std::cout << "  Measurements: " << meas_count << std::endl;
+    std::cout << "  Meters:       " << meter_count << std::endl;
+    std::cout << "  Measurements: " << meas_count << " (auto-created by meters)" << std::endl;
     
     // Upload model to GPU
     if (sle_UploadModel(engine) != SLE_OK) {
@@ -439,22 +499,12 @@ int main() {
     
     std::cout << "GPU Memory Used: " << (sle_GetGPUMemoryUsage(engine) / 1024) << " KB" << std::endl;
     
-    // Prepare initial measurement values (from power flow solution)
-    SLE_Real voltages[14], p_inj[5], q_inj[3], p_flow[4], q_flow[3];
-    getIEEE14TrueMeasurements(voltages, p_inj, q_inj, p_flow, q_flow);
-    
-    // Assemble telemetry vector in measurement order
-    std::vector<SLE_Real> telemetry;
-    for (int i = 0; i < 14; ++i) telemetry.push_back(voltages[i]);
-    for (int i = 0; i < 5; ++i) telemetry.push_back(p_inj[i]);
-    for (int i = 0; i < 3; ++i) telemetry.push_back(q_inj[i]);
-    for (int i = 0; i < 4; ++i) telemetry.push_back(p_flow[i]);
-    for (int i = 0; i < 3; ++i) telemetry.push_back(q_flow[i]);
-    telemetry.push_back(0.0f);  // P7 pseudo
-    telemetry.push_back(0.0f);  // Q7 pseudo
-    
-    // Update telemetry
-    sle_UpdateTelemetry(engine, telemetry.data(), static_cast<int32_t>(telemetry.size()));
+    //-------------------------------------------------------------------------
+    // METER-BASED TELEMETRY UPDATE (Phase 1)
+    // All values come through meters - no raw measurement updates
+    //-------------------------------------------------------------------------
+    std::cout << "\nInitializing meter readings (true power flow values)..." << std::endl;
+    initializeMeterReadings(engine);
     
     // Run FULL estimation (Precision Mode - FR-12)
     SLE_Result result1;
@@ -462,25 +512,63 @@ int main() {
     printResult(result1, "Phase 1: Full WLS Run (Precision Mode)");
     printVoltages(engine, bus_count);
     
+    // Show meter estimates after solve
+    std::cout << "\nMeter Estimated Values (after solve):" << std::endl;
+    std::cout << "  VM1 (Bus1) V estimate: ";
+    SLE_Real est_v1;
+    if (sle_GetMeterEstimate(engine, "VM1", "V", &est_v1) == SLE_OK) {
+        std::cout << est_v1 << " p.u." << std::endl;
+    }
+    
+    std::cout << "  MM1-2 (Line1-2) P estimate: ";
+    SLE_Real est_p12;
+    if (sle_GetMeterEstimate(engine, "MM1-2", "kW", &est_p12) == SLE_OK) {
+        std::cout << est_p12 << " p.u." << std::endl;
+    }
+    
     //=========================================================================
-    // PHASE 2: Telemetry Update & Fast WLS Run (FR-11, FR-16)
+    // PHASE 2: Meter Telemetry Update & Fast WLS Run (FR-11, FR-16)
     //=========================================================================
-    std::cout << "\n>>> Phase 2: Telemetry Update & Fast WLS Run (FR-11, FR-16)" << std::endl;
+    std::cout << "\n>>> Phase 2: Meter Update & Fast WLS Run (FR-11, FR-16)" << std::endl;
     
-    // Create sigma array for noise
-    SLE_Real sigmas[31];
-    for (int i = 0; i < 14; ++i) sigmas[i] = 0.004f;
-    for (int i = 14; i < 29; ++i) sigmas[i] = 0.01f;
-    sigmas[29] = 0.001f;
-    sigmas[30] = 0.001f;
+    std::cout << "\n=== METER-CENTRIC TELEMETRY ===" << std::endl;
+    std::cout << "All updates go through physical meters:" << std::endl;
+    std::cout << "  - VM1..VM14: Voltmeters on each bus" << std::endl;
+    std::cout << "  - MM1-2, MM1-5, MM2-3, MM2-4: Multimeters on branches" << std::endl;
+    std::cout << "  - WM2-5, WM3-4, etc.: Wattmeters on branches" << std::endl;
     
-    // Add noise to measurements
-    addMeasurementNoise(telemetry.data(), sigmas, 31, 123);
+    // Update individual meter readings
+    std::cout << "\nUpdating meter readings..." << std::endl;
     
-    // Update telemetry (fast async copy)
-    sle_UpdateTelemetry(engine, telemetry.data(), static_cast<int32_t>(telemetry.size()));
+    // Simulate voltage changes at key buses
+    sle_UpdateMeterReading(engine, "VM1", "V", 1.058f);   // Bus 1 voltage
+    sle_UpdateMeterReading(engine, "VM2", "V", 1.043f);   // Bus 2 voltage
+    sle_UpdateMeterReading(engine, "VM3", "V", 1.008f);   // Bus 3 voltage
+    
+    // Simulate power flow changes on key branches
+    sle_UpdateMeterReading(engine, "MM1-2", "kW", 1.55f);     // Line1-2 P
+    sle_UpdateMeterReading(engine, "MM1-2", "kVAR", -0.21f);  // Line1-2 Q
+    sle_UpdateMeterReading(engine, "MM1-5", "kW", 0.74f);     // Line1-5 P
+    sle_UpdateMeterReading(engine, "MM1-5", "kVAR", 0.04f);   // Line1-5 Q
+    
+    // Batch meter updates using SLE_MeterReading
+    std::cout << "Batch updating meter readings..." << std::endl;
+    SLE_MeterReading batch_readings[] = {
+        {"VM4", "V", 1.016f},
+        {"VM5", "V", 1.018f},
+        {"MM2-3", "kW", 0.73f},
+        {"MM2-3", "kVAR", 0.03f},
+        {"WM2-5", "kW", 0.41f},
+        {"WM2-5", "kVAR", 0.01f}
+    };
+    sle_UpdateMeterReadings(engine, batch_readings, 6, 0);  // Don't sync yet
+    
+    // Add measurement noise to all meters
+    std::cout << "Adding measurement noise to all meters..." << std::endl;
+    addMeterNoise(engine, 123);
     
     // Run FAST estimation (Real-time Mode - FR-11)
+    // Measurement values auto-sync to GPU during solve()
     SLE_Result result2;
     sle_Solve(engine, SLE_MODE_REALTIME, &result2);
     printResult(result2, "Phase 2: Fast WLS Run (Real-time Mode, Gain Matrix Reuse)");
@@ -493,6 +581,14 @@ int main() {
         std::cout << "  Speedup:   " << (result1.computation_time_ms / result2.computation_time_ms) 
                   << "x" << std::endl;
     }
+    
+    // Show residuals from meters
+    std::cout << "\nMeter Residuals:" << std::endl;
+    SLE_Real resid;
+    sle_GetMeterResidual(engine, "VM1", "V", &resid);
+    std::cout << "  VM1 residual: " << resid << std::endl;
+    sle_GetMeterResidual(engine, "MM1-2", "kW", &resid);
+    std::cout << "  MM1-2 P residual: " << resid << std::endl;
     
     //=========================================================================
     // PHASE 3: Switching Device Update & Fast Run (FR-05)
@@ -590,9 +686,11 @@ int main() {
         return 1;
     }
     
-    // Add telemetry for new measurement
-    telemetry.push_back(0.05f);
-    sle_UpdateTelemetry(engine, telemetry.data(), static_cast<int32_t>(telemetry.size()));
+    // Re-initialize meter readings after model change
+    initializeMeterReadings(engine);
+    
+    // Update the new measurement value via low-level API (no meter for it)
+    sle_UpdateMeasurement(engine, "P10-14", 0.05f);
     
     // Run FULL estimation
     SLE_Result result5;
@@ -605,9 +703,9 @@ int main() {
     //=========================================================================
     std::cout << "\n>>> Phase 6: Bad Data Detection (FR-15)" << std::endl;
     
-    // Inject bad data into one measurement
-    telemetry[0] = 2.0f;  // Corrupt Bus 1 voltage (should be ~1.06)
-    sle_UpdateTelemetry(engine, telemetry.data(), static_cast<int32_t>(telemetry.size()));
+    // Inject bad data via a meter (corrupt Bus 1 voltage)
+    std::cout << "Injecting bad data: VM1 voltage = 2.0 p.u. (should be ~1.06)" << std::endl;
+    sle_UpdateMeterReading(engine, "VM1", "V", 2.0f);
     
     SLE_Result result6;
     sle_Solve(engine, SLE_MODE_PRECISION, &result6);
@@ -615,19 +713,22 @@ int main() {
     
     // Identify bad data
     int32_t bad_indices[100];
-    int32_t bad_count = 0;
-    sle_IdentifyBadData(engine, 3.0f, bad_indices, 100, &bad_count);
+    int32_t bad_count_detected = 0;
+    sle_IdentifyBadData(engine, 3.0f, bad_indices, 100, &bad_count_detected);
     
     std::cout << "\nBad Data Detection:" << std::endl;
-    std::cout << "  Identified " << bad_count << " bad measurement(s)" << std::endl;
+    std::cout << "  Identified " << bad_count_detected << " bad measurement(s)" << std::endl;
     
-    std::vector<SLE_Real> residuals(telemetry.size());
-    sle_GetResiduals(engine, residuals.data(), static_cast<int32_t>(residuals.size()));
+    std::vector<SLE_Real> residuals(meas_count);
+    sle_GetResiduals(engine, residuals.data(), meas_count);
     
-    for (int32_t i = 0; i < bad_count; ++i) {
+    for (int32_t i = 0; i < bad_count_detected; ++i) {
         std::cout << "  - Measurement index " << bad_indices[i] 
                   << ", residual = " << residuals[bad_indices[i]] << std::endl;
     }
+    
+    // Restore good value
+    sle_UpdateMeterReading(engine, "VM1", "V", 1.06f);
     
     //=========================================================================
     // PHASE 7: Robust Estimation (FR-17)
@@ -659,13 +760,20 @@ int main() {
     std::cout << "\n========================================" << std::endl;
     std::cout << " Example Complete - Summary" << std::endl;
     std::cout << "========================================" << std::endl;
-    std::cout << "Phase 1: Full model upload and precision estimation" << std::endl;
-    std::cout << "Phase 2: Fast telemetry update with gain matrix reuse" << std::endl;
+    std::cout << "Phase 1: Model upload with METER-BASED measurements" << std::endl;
+    std::cout << "Phase 2: Meter telemetry update with gain matrix reuse" << std::endl;
     std::cout << "Phase 3: Topology change (switch operation)" << std::endl;
     std::cout << "Phase 4: Transformer tap update" << std::endl;
     std::cout << "Phase 5: Structural modification (add branch)" << std::endl;
-    std::cout << "Phase 6: Bad data detection" << std::endl;
+    std::cout << "Phase 6: Bad data detection via meter" << std::endl;
     std::cout << "Phase 7: Robust estimation" << std::endl;
+    std::cout << "\n=== METER-CENTRIC DESIGN ===" << std::endl;
+    std::cout << "All telemetry flows through METERS (physical metering devices):" << std::endl;
+    std::cout << "  - Voltmeters (VM1-VM14): Voltage on each bus" << std::endl;
+    std::cout << "  - Multimeters (MM1-2, etc.): P, Q, V, I on branches" << std::endl;
+    std::cout << "  - Wattmeters (WM2-5, etc.): P, Q on branches" << std::endl;
+    std::cout << "  - sle_UpdateMeterReading() -> updates underlying measurement" << std::endl;
+    std::cout << "  - sle_GetMeterEstimate() -> reads estimated value after solve" << std::endl;
     std::cout << "\nAll FR requirements demonstrated successfully!" << std::endl;
     
     // Cleanup

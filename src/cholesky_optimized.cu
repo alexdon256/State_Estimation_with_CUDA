@@ -343,7 +343,7 @@ cudaError_t OptimizedCholeskySolver::analyzePattern(
     // Build elimination tree
     cache_.etree.resize(n_param);
     sle::buildEliminationTree(n_param, h_row_ptr.data(), h_col_ind.data(),
-                              cache_.perm.data(), cache_.etree.data());
+                        cache_.perm.data(), cache_.etree.data());
     
     // Compute pattern hash
     cache_.pattern_hash = SymbolicAnalysisCache::computePatternHash(
@@ -399,8 +399,8 @@ cudaError_t OptimizedCholeskySolver::factorize(const Real* d_values) {
         if (err != cudaSuccess) return err;
         
         err = cudaMalloc(&cached_row_ptr_, (current_n_ + 1) * sizeof(int32_t));
-        if (err != cudaSuccess) return err;
-        
+    if (err != cudaSuccess) return err;
+    
         err = cudaMalloc(&cached_col_ind_, current_nnz_ * sizeof(int32_t));
         if (err != cudaSuccess) return err;
     }
@@ -509,12 +509,12 @@ cudaError_t OptimizedCholeskySolver::solveMultiple(
     
     if (nrhs < BATCH_THRESHOLD_NRHS || current_n_ < BATCH_THRESHOLD_N) {
         // Sequential solve - simple and efficient for small problems
-        for (int32_t i = 0; i < nrhs; ++i) {
-            const Real* d_bi = d_B + i * current_n_;
-            Real* d_xi = d_X + i * current_n_;
-            
-            cudaError_t err = solve(d_bi, d_xi);
-            if (err != cudaSuccess) return err;
+    for (int32_t i = 0; i < nrhs; ++i) {
+        const Real* d_bi = d_B + i * current_n_;
+        Real* d_xi = d_X + i * current_n_;
+        
+        cudaError_t err = solve(d_bi, d_xi);
+        if (err != cudaSuccess) return err;
         }
     } else {
         // Batched solve using multiple streams for better GPU utilization

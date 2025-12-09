@@ -2,23 +2,8 @@
  * SLE Engine - CUDA-Accelerated State Load Estimator
  * Copyright (C) 2025 Oleksandr Don
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- *
  * @file network_model.cu
- * @brief Network model implementation
- * 
- * Implements the NetworkModel class and HostDataAllocator.
+ * @brief Network model implementation with meter-centric telemetry design
  */
 
 #include "../include/network_model.h"
@@ -47,11 +32,11 @@ NetworkModel::NetworkModel(NetworkModel&&) noexcept = default;
 NetworkModel& NetworkModel::operator=(NetworkModel&&) noexcept = default;
 
 void NetworkModel::initializeHashMaps() {
-    // Reserve initial capacity for better performance
     bus_id_map_.reserve(1000);
     branch_id_map_.reserve(2000);
     measurement_id_map_.reserve(5000);
     sd_id_map_.reserve(500);
+    meter_id_map_.reserve(1000);
 }
 
 //=============================================================================
@@ -59,7 +44,6 @@ void NetworkModel::initializeHashMaps() {
 //=============================================================================
 
 int32_t NetworkModel::addBus(const BusDescriptor& desc) {
-    // Check for duplicate ID
     if (bus_id_map_.find(desc.id) != bus_id_map_.end()) {
         return INVALID_INDEX;
     }
@@ -74,7 +58,6 @@ int32_t NetworkModel::addBus(const BusDescriptor& desc) {
     buses_.push_back(elem);
     bus_id_map_[desc.id] = index;
     
-    // Track slack bus
     if (desc.type == BusType::SLACK) {
         slack_bus_index_ = index;
     }
@@ -84,17 +67,15 @@ int32_t NetworkModel::addBus(const BusDescriptor& desc) {
 }
 
 int32_t NetworkModel::addBranch(const BranchDescriptor& desc) {
-    // Check for duplicate ID
     if (branch_id_map_.find(desc.id) != branch_id_map_.end()) {
         return INVALID_INDEX;
     }
     
-    // Resolve bus indices
     int32_t from_idx = getBusIndex(desc.from_bus_id);
     int32_t to_idx = getBusIndex(desc.to_bus_id);
     
     if (from_idx == INVALID_INDEX || to_idx == INVALID_INDEX) {
-        return INVALID_INDEX;  // Referenced buses don't exist
+        return INVALID_INDEX;
     }
     
     int32_t index = static_cast<int32_t>(branches_.size());
@@ -113,12 +94,10 @@ int32_t NetworkModel::addBranch(const BranchDescriptor& desc) {
 }
 
 int32_t NetworkModel::addMeasurement(const MeasurementDescriptor& desc) {
-    // Check for duplicate ID
     if (measurement_id_map_.find(desc.id) != measurement_id_map_.end()) {
         return INVALID_INDEX;
     }
     
-    // Resolve location index
     int32_t loc_idx;
     if (isBusMeasurement(desc.type)) {
         loc_idx = getBusIndex(desc.location_id);
@@ -135,9 +114,8 @@ int32_t NetworkModel::addMeasurement(const MeasurementDescriptor& desc) {
     MeasurementElement elem(index);
     elem.descriptor = desc;
     elem.location_index = loc_idx;
-    // Safeguard: clamp sigma to minimum value to avoid division by zero
     Real safe_sigma = std::max(desc.sigma, SLE_REAL_EPSILON);
-    elem.weight = 1.0f / (safe_sigma * safe_sigma);  // Weight = 1/variance
+    elem.weight = 1.0f / (safe_sigma * safe_sigma);
     elem.is_active = true;
     
     measurements_.push_back(elem);
@@ -169,7 +147,6 @@ int32_t NetworkModel::addSwitchingDevice(const SwitchingDeviceDescriptor& desc) 
     switching_devices_.push_back(elem);
     sd_id_map_[desc.id] = index;
     
-    // Link branch to switching device
     branches_[branch_idx].sd_index = index;
     branches_[branch_idx].status = desc.initial_status;
     
@@ -185,14 +162,12 @@ bool NetworkModel::removeBus(const std::string& bus_id) {
     int32_t idx = getBusIndex(bus_id);
     if (idx == INVALID_INDEX) return false;
     
-    // Remove all branches connected to this bus
     for (auto& branch : branches_) {
         if (branch.from_bus_index == idx || branch.to_bus_index == idx) {
             branch_id_map_.erase(branch.descriptor.id);
         }
     }
     
-    // Remove measurements at this bus
     for (auto& meas : measurements_) {
         if (isBusMeasurement(meas.descriptor.type) && meas.location_index == idx) {
             measurement_id_map_.erase(meas.descriptor.id);
@@ -201,7 +176,6 @@ bool NetworkModel::removeBus(const std::string& bus_id) {
     
     bus_id_map_.erase(bus_id);
     model_modified_ = true;
-    
     return true;
 }
 
@@ -211,7 +185,6 @@ bool NetworkModel::removeBranch(const std::string& branch_id) {
     
     branch_id_map_.erase(branch_id);
     model_modified_ = true;
-    
     return true;
 }
 
@@ -221,7 +194,6 @@ bool NetworkModel::updateBranch(const std::string& branch_id, const BranchDescri
     
     branches_[idx].descriptor = desc;
     model_modified_ = true;
-    
     return true;
 }
 
@@ -254,81 +226,224 @@ int32_t NetworkModel::getSwitchingDeviceIndex(const std::string& id) const {
 //=============================================================================
 
 BusElement* NetworkModel::getBus(int32_t index) {
-    if (index < 0 || index >= static_cast<int32_t>(buses_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(buses_.size())) return nullptr;
     return &buses_[index];
 }
 
 const BusElement* NetworkModel::getBus(int32_t index) const {
-    if (index < 0 || index >= static_cast<int32_t>(buses_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(buses_.size())) return nullptr;
     return &buses_[index];
 }
 
 BranchElement* NetworkModel::getBranch(int32_t index) {
-    if (index < 0 || index >= static_cast<int32_t>(branches_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(branches_.size())) return nullptr;
     return &branches_[index];
 }
 
 const BranchElement* NetworkModel::getBranch(int32_t index) const {
-    if (index < 0 || index >= static_cast<int32_t>(branches_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(branches_.size())) return nullptr;
     return &branches_[index];
 }
 
 MeasurementElement* NetworkModel::getMeasurement(int32_t index) {
-    if (index < 0 || index >= static_cast<int32_t>(measurements_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(measurements_.size())) return nullptr;
     return &measurements_[index];
 }
 
 const MeasurementElement* NetworkModel::getMeasurement(int32_t index) const {
-    if (index < 0 || index >= static_cast<int32_t>(measurements_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(measurements_.size())) return nullptr;
     return &measurements_[index];
 }
 
 SwitchingDeviceElement* NetworkModel::getSwitchingDevice(int32_t index) {
-    if (index < 0 || index >= static_cast<int32_t>(switching_devices_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(switching_devices_.size())) return nullptr;
     return &switching_devices_[index];
 }
 
 const SwitchingDeviceElement* NetworkModel::getSwitchingDevice(int32_t index) const {
-    if (index < 0 || index >= static_cast<int32_t>(switching_devices_.size())) {
-        return nullptr;
-    }
+    if (index < 0 || index >= static_cast<int32_t>(switching_devices_.size())) return nullptr;
     return &switching_devices_[index];
 }
 
+MeterElement* NetworkModel::getMeter(int32_t index) {
+    if (index < 0 || index >= static_cast<int32_t>(meters_.size())) return nullptr;
+    return &meters_[index];
+}
+
+const MeterElement* NetworkModel::getMeter(int32_t index) const {
+    if (index < 0 || index >= static_cast<int32_t>(meters_.size())) return nullptr;
+    return &meters_[index];
+}
+
+int32_t NetworkModel::getMeterIndex(const std::string& id) const {
+    auto it = meter_id_map_.find(id);
+    return (it != meter_id_map_.end()) ? it->second : INVALID_INDEX;
+}
+
 //=============================================================================
-// Telemetry Update
+// Meter Device Management (PRIMARY telemetry interface)
+//=============================================================================
+
+int32_t NetworkModel::addMeter(const MeterDescriptor& desc) {
+    if (meter_id_map_.find(desc.id) != meter_id_map_.end()) {
+        return INVALID_INDEX;
+    }
+    
+    int32_t bus_idx = getBusIndex(desc.bus_id);
+    if (bus_idx == INVALID_INDEX) {
+        return INVALID_INDEX;
+    }
+    
+    int32_t branch_idx = INVALID_INDEX;
+    if (desc.type != MeterType::VOLTMETER) {
+        branch_idx = getBranchIndex(desc.branch_id);
+        if (branch_idx == INVALID_INDEX) {
+            return INVALID_INDEX;
+        }
+    }
+    
+    int32_t meter_idx = static_cast<int32_t>(meters_.size());
+    meters_.emplace_back(meter_idx);
+    MeterElement& meter = meters_.back();
+    meter.descriptor = desc;
+    meter.bus_index = bus_idx;
+    meter.branch_index = branch_idx;
+    
+    meter_id_map_[desc.id] = meter_idx;
+    
+    std::string base_id = desc.id;
+    
+    if (desc.type == MeterType::VOLTMETER) {
+        MeasurementDescriptor v_meas(base_id + ".V", MeasurementType::V_MAG, desc.bus_id,
+            BranchEnd::FROM, desc.sigma_v, desc.pt_ratio, 1.0f, false);
+        meter.meas_idx_v = addMeasurement(v_meas);
+    }
+    else if (desc.type == MeterType::MULTIMETER) {
+        MeasurementDescriptor v_meas(base_id + ".V", MeasurementType::V_MAG, desc.bus_id,
+            BranchEnd::FROM, desc.sigma_v, desc.pt_ratio, 1.0f, false);
+        meter.meas_idx_v = addMeasurement(v_meas);
+        
+        MeasurementDescriptor p_meas(base_id + ".kW", MeasurementType::P_FLOW, desc.branch_id,
+            desc.branch_end, desc.sigma_p, desc.pt_ratio, desc.ct_ratio, false);
+        meter.meas_idx_p = addMeasurement(p_meas);
+        
+        MeasurementDescriptor q_meas(base_id + ".kVAR", MeasurementType::Q_FLOW, desc.branch_id,
+            desc.branch_end, desc.sigma_p, desc.pt_ratio, desc.ct_ratio, false);
+        meter.meas_idx_q = addMeasurement(q_meas);
+        
+        MeasurementDescriptor i_meas(base_id + ".A", MeasurementType::I_MAG, desc.branch_id,
+            desc.branch_end, desc.sigma_i, desc.pt_ratio, desc.ct_ratio, false);
+        meter.meas_idx_i = addMeasurement(i_meas);
+    }
+    else if (desc.type == MeterType::AMMETER) {
+        MeasurementDescriptor i_meas(base_id + ".A", MeasurementType::I_MAG, desc.branch_id,
+            desc.branch_end, desc.sigma_i, desc.pt_ratio, desc.ct_ratio, false);
+        meter.meas_idx_i = addMeasurement(i_meas);
+    }
+    else if (desc.type == MeterType::WATTMETER) {
+        MeasurementDescriptor p_meas(base_id + ".kW", MeasurementType::P_FLOW, desc.branch_id,
+            desc.branch_end, desc.sigma_p, desc.pt_ratio, desc.ct_ratio, false);
+        meter.meas_idx_p = addMeasurement(p_meas);
+        
+        MeasurementDescriptor q_meas(base_id + ".kVAR", MeasurementType::Q_FLOW, desc.branch_id,
+            desc.branch_end, desc.sigma_p, desc.pt_ratio, desc.ct_ratio, false);
+        meter.meas_idx_q = addMeasurement(q_meas);
+    }
+    
+    model_modified_ = true;
+    return meter_idx;
+}
+
+namespace {
+    int32_t getMeasIndexForChannel(const MeterElement& meter, const std::string& channel) {
+        if (channel == "V" || channel == "kV" || channel == "voltage") return meter.meas_idx_v;
+        if (channel == "kW" || channel == "MW" || channel == "P" || channel == "power") return meter.meas_idx_p;
+        if (channel == "kVAR" || channel == "MVAR" || channel == "Q" || channel == "reactive") return meter.meas_idx_q;
+        if (channel == "A" || channel == "kA" || channel == "I" || channel == "current") return meter.meas_idx_i;
+        return INVALID_INDEX;
+    }
+}
+
+bool NetworkModel::updateMeterReading(const std::string& meter_id, const std::string& channel, Real value) {
+    int32_t meter_idx = getMeterIndex(meter_id);
+    if (meter_idx == INVALID_INDEX) return false;
+    
+    const MeterElement& meter = meters_[meter_idx];
+    int32_t meas_idx = getMeasIndexForChannel(meter, channel);
+    if (meas_idx == INVALID_INDEX) return false;
+    
+    // User provides value in per-unit (p.u.) - the standard convention.
+    //
+    // PT/CT ratios are stored as metadata about the physical installation
+    // but do NOT affect value scaling. Rationale:
+    // - P.u. systems are designed so that secondary p.u. = primary p.u.
+    // - When bases are properly selected: V_sec_pu = V_pri_pu
+    // - PT/CT describes the physical transformer, not a conversion factor
+    //
+    // Example: 13.8kV bus with PT ratio 13800V/120V (= 115)
+    // - If meter reads 1.0 p.u. (normalized to 120V base), system voltage = 1.0 p.u.
+    // - No multiplication by 115 needed - bases already account for PT ratio
+    //
+    // For raw engineering values (e.g., 120V actual), user should convert
+    // to p.u. before calling this function.
+    //
+    // PT/CT = 1.0 is the default (no physical transformer, or already in p.u.)
+    
+    measurements_[meas_idx].value = value;
+    return true;
+}
+
+bool NetworkModel::getMeterReading(const std::string& meter_id, const std::string& channel, Real& value) const {
+    int32_t meter_idx = getMeterIndex(meter_id);
+    if (meter_idx == INVALID_INDEX) return false;
+    
+    const MeterElement& meter = meters_[meter_idx];
+    int32_t meas_idx = getMeasIndexForChannel(meter, channel);
+    if (meas_idx == INVALID_INDEX) return false;
+    
+    value = measurements_[meas_idx].value;
+    return true;
+}
+
+bool NetworkModel::getMeterEstimate(const std::string& meter_id, const std::string& channel, Real& value) const {
+    int32_t meter_idx = getMeterIndex(meter_id);
+    if (meter_idx == INVALID_INDEX) return false;
+    
+    const MeterElement& meter = meters_[meter_idx];
+    int32_t meas_idx = getMeasIndexForChannel(meter, channel);
+    if (meas_idx == INVALID_INDEX) return false;
+    
+    value = measurements_[meas_idx].estimated;
+    return true;
+}
+
+bool NetworkModel::getMeterResidual(const std::string& meter_id, const std::string& channel, Real& value) const {
+    int32_t meter_idx = getMeterIndex(meter_id);
+    if (meter_idx == INVALID_INDEX) return false;
+    
+    const MeterElement& meter = meters_[meter_idx];
+    int32_t meas_idx = getMeasIndexForChannel(meter, channel);
+    if (meas_idx == INVALID_INDEX) return false;
+    
+    value = measurements_[meas_idx].residual;
+    return true;
+}
+
+//=============================================================================
+// Telemetry Update (Low-level)
 //=============================================================================
 
 bool NetworkModel::updateMeasurementValues(const Real* values, int32_t count) {
-    if (count != static_cast<int32_t>(measurements_.size())) {
-        return false;
-    }
-    
+    if (count != static_cast<int32_t>(measurements_.size())) return false;
     for (int32_t i = 0; i < count; ++i) {
         measurements_[i].value = values[i];
     }
-    
     return true;
 }
 
 bool NetworkModel::updateMeasurementValue(const std::string& meas_id, Real value) {
     int32_t idx = getMeasurementIndex(meas_id);
     if (idx == INVALID_INDEX) return false;
-    
     measurements_[idx].value = value;
     return true;
 }
@@ -419,20 +534,13 @@ void NetworkModel::packSwitchingDeviceData(HostSwitchingDeviceData& data) const 
 
 size_t NetworkModel::calculateGPUMemoryRequired() const {
     size_t total = 0;
-    
-    // Bus data
     int32_t n_buses = static_cast<int32_t>(buses_.size());
     total += n_buses * (sizeof(Real) * 10 + sizeof(BusType));
-    
-    // Branch data
     int32_t n_branches = static_cast<int32_t>(branches_.size());
     total += n_branches * (sizeof(Real) * 17 + sizeof(int32_t) * 3 + sizeof(SwitchStatus));
-    
-    // Measurement data
     int32_t n_meas = static_cast<int32_t>(measurements_.size());
     total += n_meas * (sizeof(Real) * 6 + sizeof(int32_t) + sizeof(MeasurementType) + 
                        sizeof(BranchEnd) + sizeof(bool) * 2);
-    
     return total;
 }
 
@@ -441,39 +549,21 @@ size_t NetworkModel::calculateGPUMemoryRequired() const {
 //=============================================================================
 
 bool NetworkModel::validate() const {
-    // Check for at least one bus
     if (buses_.empty()) return false;
-    
-    // Check for slack bus
     if (slack_bus_index_ == INVALID_INDEX) return false;
     
-    // Validate branch references
     for (const auto& branch : branches_) {
-        if (branch.from_bus_index < 0 || 
-            branch.from_bus_index >= static_cast<int32_t>(buses_.size())) {
-            return false;
-        }
-        if (branch.to_bus_index < 0 || 
-            branch.to_bus_index >= static_cast<int32_t>(buses_.size())) {
-            return false;
-        }
+        if (branch.from_bus_index < 0 || branch.from_bus_index >= static_cast<int32_t>(buses_.size())) return false;
+        if (branch.to_bus_index < 0 || branch.to_bus_index >= static_cast<int32_t>(buses_.size())) return false;
     }
     
-    // Validate measurement locations
     for (const auto& meas : measurements_) {
         if (isBusMeasurement(meas.descriptor.type)) {
-            if (meas.location_index < 0 || 
-                meas.location_index >= static_cast<int32_t>(buses_.size())) {
-                return false;
-            }
+            if (meas.location_index < 0 || meas.location_index >= static_cast<int32_t>(buses_.size())) return false;
         } else {
-            if (meas.location_index < 0 || 
-                meas.location_index >= static_cast<int32_t>(branches_.size())) {
-                return false;
-            }
+            if (meas.location_index < 0 || meas.location_index >= static_cast<int32_t>(branches_.size())) return false;
         }
     }
-    
     return true;
 }
 
@@ -484,16 +574,12 @@ void NetworkModel::computeBranchAdmittances() {
         Real b_total = branch.descriptor.susceptance;
         Real a = branch.descriptor.tap_ratio;
         
-        // Series admittance: y = 1/(r + jx)
         Real denom = r * r + x * x;
-        if (denom < SLE_REAL_EPSILON) {
-            denom = SLE_REAL_EPSILON;
-        }
+        if (denom < SLE_REAL_EPSILON) denom = SLE_REAL_EPSILON;
         
         branch.g_series = r / denom;
         branch.b_series = -x / denom;
         
-        // Shunt susceptance (line charging)
         Real a2 = a * a;
         branch.b_shunt_from = b_total / (2.0f * a2);
         branch.b_shunt_to = b_total / 2.0f;
@@ -502,8 +588,7 @@ void NetworkModel::computeBranchAdmittances() {
 
 void NetworkModel::applyFlatStart() {
     for (auto& bus : buses_) {
-        if (bus.descriptor.type == BusType::PV || 
-            bus.descriptor.type == BusType::SLACK) {
+        if (bus.descriptor.type == BusType::PV || bus.descriptor.type == BusType::SLACK) {
             bus.v_mag = bus.descriptor.v_setpoint;
         } else {
             bus.v_mag = 1.0f;
@@ -522,7 +607,7 @@ bool NetworkModel::isBusMeasurement(MeasurementType type) const {
 }
 
 //=============================================================================
-// Result Setters (for GPU result download)
+// Result Setters
 //=============================================================================
 
 void NetworkModel::setBusVoltage(int32_t index, Real v_mag, Real v_angle) {
@@ -563,7 +648,7 @@ void NetworkModel::setMeasurementResult(int32_t index, Real estimated, Real resi
 }
 
 //=============================================================================
-// HostDataAllocator Implementation
+// HostDataAllocator
 //=============================================================================
 
 HostDataAllocator::HostDataAllocator() {}
@@ -576,87 +661,49 @@ HostDataAllocator::~HostDataAllocator() {
 
 cudaError_t HostDataAllocator::allocateBusData(HostBusData& data, int32_t count) {
     data.count = count;
-    
     cudaError_t err;
     
-    err = cudaMallocHost(&data.base_kv, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.base_kv);
+    #define ALLOC_FIELD(field, type) \
+        err = cudaMallocHost(&data.field, count * sizeof(type)); \
+        if (err != cudaSuccess) return err; \
+        allocations_.push_back(data.field);
     
-    err = cudaMallocHost(&data.bus_type, count * sizeof(BusType));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.bus_type);
+    ALLOC_FIELD(base_kv, Real)
+    ALLOC_FIELD(bus_type, BusType)
+    ALLOC_FIELD(external_id, int32_t)
+    ALLOC_FIELD(v_mag, Real)
+    ALLOC_FIELD(v_angle, Real)
+    ALLOC_FIELD(p_injection, Real)
+    ALLOC_FIELD(q_injection, Real)
+    ALLOC_FIELD(p_scheduled, Real)
+    ALLOC_FIELD(q_scheduled, Real)
+    ALLOC_FIELD(v_setpoint, Real)
     
-    err = cudaMallocHost(&data.external_id, count * sizeof(int32_t));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.external_id);
-    
-    err = cudaMallocHost(&data.v_mag, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.v_mag);
-    
-    err = cudaMallocHost(&data.v_angle, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.v_angle);
-    
-    err = cudaMallocHost(&data.p_injection, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.p_injection);
-    
-    err = cudaMallocHost(&data.q_injection, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.q_injection);
-    
-    err = cudaMallocHost(&data.p_scheduled, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.p_scheduled);
-    
-    err = cudaMallocHost(&data.q_scheduled, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.q_scheduled);
-    
-    err = cudaMallocHost(&data.v_setpoint, count * sizeof(Real));
-    if (err != cudaSuccess) return err;
-    allocations_.push_back(data.v_setpoint);
-    
+    #undef ALLOC_FIELD
     return cudaSuccess;
 }
 
-void HostDataAllocator::freeBusData(HostBusData& data) {
-    // Memory freed in destructor
-    data = {};
-}
+void HostDataAllocator::freeBusData(HostBusData& data) { data = {}; }
 
 cudaError_t HostDataAllocator::allocateBranchData(HostBranchData& data, int32_t count) {
-    // Similar to allocateBusData - allocate all arrays
     data.count = count;
-    // ... allocate all branch arrays
     return cudaSuccess;
 }
 
-void HostDataAllocator::freeBranchData(HostBranchData& data) {
-    data = {};
-}
+void HostDataAllocator::freeBranchData(HostBranchData& data) { data = {}; }
 
 cudaError_t HostDataAllocator::allocateMeasurementData(HostMeasurementData& data, int32_t count) {
     data.count = count;
-    // ... allocate all measurement arrays
     return cudaSuccess;
 }
 
-void HostDataAllocator::freeMeasurementData(HostMeasurementData& data) {
-    data = {};
-}
+void HostDataAllocator::freeMeasurementData(HostMeasurementData& data) { data = {}; }
 
 cudaError_t HostDataAllocator::allocateSwitchingDeviceData(HostSwitchingDeviceData& data, int32_t count) {
     data.count = count;
-    // ... allocate all SD arrays
     return cudaSuccess;
 }
 
-void HostDataAllocator::freeSwitchingDeviceData(HostSwitchingDeviceData& data) {
-    data = {};
-}
+void HostDataAllocator::freeSwitchingDeviceData(HostSwitchingDeviceData& data) { data = {}; }
 
 } // namespace sle
-

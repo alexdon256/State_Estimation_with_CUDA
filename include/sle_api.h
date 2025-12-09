@@ -243,15 +243,24 @@ typedef struct SLE_BranchInfo {
 
 /**
  * @brief Measurement definition structure
+ * 
+ * All measurement values should be provided in per-unit (p.u.).
+ * 
+ * PT/CT Ratio Convention:
+ * - pt_ratio/ct_ratio are reserved for future calibration features
+ * - Currently these values are stored but NOT used in computation
+ * - Set to 1.0 for standard operation
+ * - For meters on power transformers: The bus voltage already accounts for
+ *   transformer tap ratio via Ybus; no additional scaling needed
  */
 typedef struct SLE_MeasurementInfo {
     const char* id;              /**< Measurement string identifier */
     SLE_MeasurementType type;    /**< Measurement type */
     const char* location;        /**< Bus ID (for bus meas) or Branch ID (for flow meas) */
     SLE_BranchEnd branch_end;    /**< For branch measurements: FROM or TO */
-    SLE_Real sigma;              /**< Standard deviation for weighting */
-    SLE_Real pt_ratio;           /**< Potential transformer ratio (1.0 if N/A) */
-    SLE_Real ct_ratio;           /**< Current transformer ratio (1.0 if N/A) */
+    SLE_Real sigma;              /**< Standard deviation for weighting (p.u.) */
+    SLE_Real pt_ratio;           /**< Reserved for calibration (use 1.0) */
+    SLE_Real ct_ratio;           /**< Reserved for calibration (use 1.0) */
     int32_t is_pseudo;           /**< 1 if pseudo measurement, 0 otherwise */
 } SLE_MeasurementInfo;
 
@@ -263,6 +272,85 @@ typedef struct SLE_SwitchInfo {
     const char* branch_id;       /**< Associated branch ID */
     SLE_SwitchStatus status;     /**< Initial status (OPEN or CLOSED) */
 } SLE_SwitchInfo;
+
+/*=============================================================================
+ * Meter Device Types (Voltmeters, Multimeters)
+ *===========================================================================*/
+
+/**
+ * @brief Meter device types
+ */
+typedef enum SLE_MeterType {
+    SLE_METER_VOLTMETER = 0,     /**< Voltage meter on bus (PT only) */
+    SLE_METER_MULTIMETER = 1,    /**< Multi-function meter on branch (PT + CT) */
+    SLE_METER_AMMETER = 2,       /**< Current meter on branch (CT only) */
+    SLE_METER_WATTMETER = 3      /**< Power meter on branch (PT + CT) */
+} SLE_MeterType;
+
+/**
+ * @brief Meter channel identifiers for readings
+ * 
+ * Use these string constants with sle_UpdateMeterReading:
+ * - "V" or "kV"    - Voltage magnitude
+ * - "A" or "kA"    - Current magnitude  
+ * - "kW" or "MW"   - Active power
+ * - "kVAR" or "MVAR" - Reactive power
+ * - "deg"          - Voltage angle (if available)
+ */
+#define SLE_CHANNEL_VOLTAGE    "V"
+#define SLE_CHANNEL_VOLTAGE_KV "kV"
+#define SLE_CHANNEL_CURRENT    "A"
+#define SLE_CHANNEL_CURRENT_KA "kA"
+#define SLE_CHANNEL_POWER_KW   "kW"
+#define SLE_CHANNEL_POWER_MW   "MW"
+#define SLE_CHANNEL_REACTIVE_KVAR "kVAR"
+#define SLE_CHANNEL_REACTIVE_MVAR "MVAR"
+#define SLE_CHANNEL_ANGLE      "deg"
+
+/**
+ * @brief Meter device definition
+ * 
+ * Voltmeters connect to buses via PT.
+ * Multimeters connect to branches via PT and CT, measuring towards a bus.
+ * 
+ * IMPORTANT - Value Convention:
+ * - ALL meter readings must be provided in per-unit (p.u.)
+ * - p.u. means: value / base_value (e.g., 1.02 p.u. = 102% of nominal)
+ * - If you have raw engineering values (e.g., 120V), convert to p.u. first
+ * 
+ * PT/CT Ratio Fields:
+ * - These describe the physical instrument transformers installed
+ * - They do NOT affect value conversion (values are already in p.u.)
+ * - pt_ratio = V_primary / V_secondary (e.g., 13800/120 = 115)
+ * - ct_ratio = I_primary / I_secondary (e.g., 400/5 = 80)
+ * - Set to 1.0 if no physical transformer or if already in p.u.
+ * - Reserved for future features (uncertainty adjustment, calibration)
+ * 
+ * For meters on power transformers:
+ * - The bus voltage at the meter location already reflects transformer tap ratio
+ * - No additional scaling needed - just provide readings in p.u.
+ */
+typedef struct SLE_MeterInfo {
+    const char* id;              /**< Meter ID (e.g., "VM1", "MM1") */
+    SLE_MeterType type;          /**< Meter type */
+    const char* bus_id;          /**< Bus where meter is connected */
+    const char* branch_id;       /**< Branch ID (for multimeter/ammeter, NULL for voltmeter) */
+    SLE_BranchEnd branch_end;    /**< Measurement point on branch (FROM or TO) */
+    SLE_Real pt_ratio;           /**< Physical PT ratio (metadata, not used for scaling) */
+    SLE_Real ct_ratio;           /**< Physical CT ratio (metadata, not used for scaling) */
+    SLE_Real sigma_v;            /**< Std dev for voltage measurements (p.u.) */
+    SLE_Real sigma_p;            /**< Std dev for power measurements (p.u.) */
+    SLE_Real sigma_i;            /**< Std dev for current measurements (p.u.) */
+} SLE_MeterInfo;
+
+/**
+ * @brief Single meter reading for updates
+ */
+typedef struct SLE_MeterReading {
+    const char* meter_id;        /**< Meter device ID */
+    const char* channel;         /**< Channel name: "V", "kW", "kVAR", "A", etc. */
+    SLE_Real value;              /**< Reading value in channel units */
+} SLE_MeterReading;
 
 /**
  * @brief Estimation result structure
@@ -667,6 +755,158 @@ SLE_API SLE_Real SLE_CALL sle_GetTransformerTap(SLE_Handle handle, const char* b
 SLE_API SLE_Real SLE_CALL sle_GetTransformerPhaseShift(SLE_Handle handle, const char* branch_id);
 
 /*=============================================================================
+ * Meter Device Management (Voltmeters, Multimeters)
+ *===========================================================================*/
+
+/**
+ * @brief Add a meter device to the topology
+ * 
+ * Meters are physical devices that group related measurements:
+ * - Voltmeter: connects to a bus via PT, provides voltage measurement
+ * - Multimeter: connects to a branch via PT+CT, provides P, Q, I measurements
+ * 
+ * The meter automatically creates the underlying measurement objects.
+ * 
+ * IMPORTANT: All readings must be in per-unit (p.u.)!
+ * - Voltage: V_pu = V_actual / V_base (e.g., 14.1kV / 13.8kV = 1.02 p.u.)
+ * - Power: P_pu = P_actual / S_base (e.g., 75MW / 100MVA = 0.75 p.u.)
+ * - Current: I_pu = I_actual / I_base
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] info Meter device definition
+ * @return SLE_OK on success
+ * 
+ * @example
+ * // Add a voltmeter on Bus1
+ * SLE_MeterInfo vm = {
+ *     .id = "VM1",
+ *     .type = SLE_METER_VOLTMETER,
+ *     .bus_id = "Bus1",
+ *     .branch_id = NULL,
+ *     .pt_ratio = 115.0,  // Physical PT: 13800V/120V (metadata only)
+ *     .ct_ratio = 1.0,
+ *     .sigma_v = 0.004    // 0.4% measurement uncertainty
+ * };
+ * sle_AddMeter(engine, &vm);
+ * 
+ * // Update: ALWAYS provide reading in p.u.
+ * // If meter reads 118V secondary and PT=115, primary=13570V
+ * // For 13.8kV base: V_pu = 13570/13800 = 0.983 p.u.
+ * sle_UpdateMeterReading(engine, "VM1", "V", 0.983f);
+ * 
+ * // Add a multimeter on Line1-2 measuring from Bus1 side
+ * SLE_MeterInfo mm = {
+ *     .id = "MM1",
+ *     .type = SLE_METER_MULTIMETER,
+ *     .bus_id = "Bus1",
+ *     .branch_id = "Line1-2",
+ *     .branch_end = SLE_BRANCH_FROM,
+ *     .pt_ratio = 115.0,  // Physical PT ratio (metadata)
+ *     .ct_ratio = 80.0,   // Physical CT: 400A/5A (metadata)
+ *     .sigma_v = 0.004,
+ *     .sigma_p = 0.01,    // 1% power measurement uncertainty
+ *     .sigma_i = 0.01
+ * };
+ * sle_AddMeter(engine, &mm);
+ * 
+ * // Update: provide readings in p.u.
+ * sle_UpdateMeterReading(engine, "MM1", "kW", 0.75f);   // 75MW on 100MVA base
+ * sle_UpdateMeterReading(engine, "MM1", "kVAR", 0.25f); // 25MVAR on 100MVA base
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_AddMeter(SLE_Handle handle, const SLE_MeterInfo* info);
+
+/**
+ * @brief Update a single meter reading by channel
+ * 
+ * Updates the meter reading in host memory. Changes are synced to GPU
+ * on next solve or when sle_SyncMeasurementsToDevice() is called.
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] meter_id Meter device ID
+ * @param[in] channel Channel name ("V", "kW", "kVAR", "A", etc.)
+ * @param[in] value Reading value in channel units
+ * @return SLE_OK on success
+ * 
+ * @example
+ * sle_UpdateMeterReading(engine, "VM1", "V", 1.06);      // Voltage in p.u.
+ * sle_UpdateMeterReading(engine, "MM1", "kW", 156.9);    // Active power in kW
+ * sle_UpdateMeterReading(engine, "MM1", "kVAR", -20.4);  // Reactive power in kVAR
+ * sle_UpdateMeterReading(engine, "MM1", "A", 125.3);     // Current in Amps
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeterReading(SLE_Handle handle,
+                                                        const char* meter_id,
+                                                        const char* channel,
+                                                        SLE_Real value);
+
+/**
+ * @brief Update multiple meter readings at once
+ * 
+ * Efficiently updates multiple readings from different meters.
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] readings Array of meter readings
+ * @param[in] count Number of readings
+ * @param[in] sync_to_device If 1, immediately sync to GPU; if 0, defer until solve
+ * @return SLE_OK on success
+ * 
+ * @example
+ * SLE_MeterReading readings[] = {
+ *     {"VM1", "V", 1.06},
+ *     {"VM2", "V", 1.045},
+ *     {"MM1", "kW", 156.9},
+ *     {"MM1", "kVAR", -20.4},
+ *     {"MM2", "kW", 75.5}
+ * };
+ * sle_UpdateMeterReadings(engine, readings, 5, 1);
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeterReadings(SLE_Handle handle,
+                                                         const SLE_MeterReading* readings,
+                                                         int32_t count,
+                                                         int32_t sync_to_device);
+
+/**
+ * @brief Get current meter reading
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] meter_id Meter device ID
+ * @param[in] channel Channel name
+ * @param[out] value Pointer to receive reading value
+ * @return SLE_OK on success
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeterReading(SLE_Handle handle,
+                                                     const char* meter_id,
+                                                     const char* channel,
+                                                     SLE_Real* value);
+
+/**
+ * @brief Get estimated value for a meter channel (after solve)
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] meter_id Meter device ID
+ * @param[in] channel Channel name
+ * @param[out] value Pointer to receive estimated value
+ * @return SLE_OK on success
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeterEstimate(SLE_Handle handle,
+                                                      const char* meter_id,
+                                                      const char* channel,
+                                                      SLE_Real* value);
+
+/**
+ * @brief Get residual for a meter channel (after solve)
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] meter_id Meter device ID
+ * @param[in] channel Channel name
+ * @param[out] residual Pointer to receive residual (measured - estimated)
+ * @return SLE_OK on success
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeterResidual(SLE_Handle handle,
+                                                      const char* meter_id,
+                                                      const char* channel,
+                                                      SLE_Real* residual);
+
+/*=============================================================================
  * GPU Data Management (FR-06, FR-07)
  *===========================================================================*/
 
@@ -698,16 +938,101 @@ SLE_API SLE_StatusCode SLE_CALL sle_UpdateTelemetry(SLE_Handle handle,
                                                      int32_t count);
 
 /**
- * @brief Update single measurement value by ID
+ * @brief Update single measurement value by ID (host-side only)
+ * 
+ * Updates the measurement value in host memory. Call sle_SyncMeasurementsToDevice()
+ * after updating all measurements to transfer to GPU, or the next sle_Solve() will
+ * sync automatically.
  * 
  * @param[in] handle Engine handle
  * @param[in] meas_id Measurement string ID
  * @param[in] value New measurement value
- * @return SLE_OK on success
+ * @return SLE_OK on success, SLE_ERROR_ELEMENT_NOT_FOUND if ID not found
  */
 SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeasurement(SLE_Handle handle,
                                                        const char* meas_id,
                                                        SLE_Real value);
+
+/**
+ * @brief Measurement value update entry for batch operations
+ */
+typedef struct SLE_MeasurementUpdate {
+    const char* meas_id;    /**< Measurement string ID */
+    SLE_Real value;         /**< New measurement value */
+} SLE_MeasurementUpdate;
+
+/**
+ * @brief Update multiple measurements by ID in one call
+ * 
+ * More efficient than calling sle_UpdateMeasurement repeatedly.
+ * Updates host memory and optionally syncs to GPU.
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] updates Array of measurement updates
+ * @param[in] count Number of updates
+ * @param[in] sync_to_device If 1, immediately sync to GPU; if 0, defer until solve
+ * @return SLE_OK on success, SLE_ERROR_ELEMENT_NOT_FOUND if any ID not found
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeasurementBatch(SLE_Handle handle,
+                                                            const SLE_MeasurementUpdate* updates,
+                                                            int32_t count,
+                                                            int32_t sync_to_device);
+
+/**
+ * @brief Sync measurement values from host to GPU
+ * 
+ * Call after sle_UpdateMeasurement() if you want to ensure values
+ * are on GPU before solve. The solve functions call this automatically.
+ * 
+ * @param[in] handle Engine handle
+ * @return SLE_OK on success
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_SyncMeasurementsToDevice(SLE_Handle handle);
+
+/**
+ * @brief Detailed measurement information (read-only)
+ */
+typedef struct SLE_MeasurementDetails {
+    const char* id;              /**< Measurement string ID */
+    SLE_MeasurementType type;    /**< Measurement type (V_MAG, P_FLOW, etc.) */
+    const char* location_id;     /**< Location: bus ID or branch ID */
+    SLE_BranchEnd branch_end;    /**< For branch measurements: FROM or TO */
+    SLE_Real sigma;              /**< Standard deviation */
+    SLE_Real pt_ratio;           /**< PT ratio */
+    SLE_Real ct_ratio;           /**< CT ratio */
+    int32_t is_pseudo;           /**< 1 if pseudo-measurement */
+    int32_t internal_index;      /**< Internal array index (for sle_UpdateTelemetry) */
+    SLE_Real current_value;      /**< Current measurement value */
+    SLE_Real estimated_value;    /**< Last estimated h(x) after solve */
+    SLE_Real residual;           /**< Last residual z - h(x) */
+    int32_t is_active;           /**< 1 if measurement is active */
+} SLE_MeasurementDetails;
+
+/**
+ * @brief Get detailed information about a measurement
+ * 
+ * Returns complete information about a measurement including its location,
+ * type, current value, and last estimation results.
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] meas_id Measurement string ID
+ * @param[out] details Pointer to receive measurement details
+ * @return SLE_OK on success, SLE_ERROR_ELEMENT_NOT_FOUND if ID not found
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeasurementDetails(SLE_Handle handle,
+                                                           const char* meas_id,
+                                                           SLE_MeasurementDetails* details);
+
+/**
+ * @brief Get measurement ID by internal index
+ * 
+ * Useful for interpreting results from sle_UpdateTelemetry or residual arrays.
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] index Internal measurement index (0 to measurement_count-1)
+ * @return Measurement ID string, or NULL if index invalid
+ */
+SLE_API const char* SLE_CALL sle_GetMeasurementIdByIndex(SLE_Handle handle, int32_t index);
 
 /*=============================================================================
  * Switch Control (FR-03, FR-05)
@@ -951,6 +1276,11 @@ SLE_API int32_t SLE_CALL sle_GetBranchCount(SLE_Handle handle);
  * @brief Get number of measurements in model
  */
 SLE_API int32_t SLE_CALL sle_GetMeasurementCount(SLE_Handle handle);
+
+/**
+ * @brief Get number of meters in model
+ */
+SLE_API int32_t SLE_CALL sle_GetMeterCount(SLE_Handle handle);
 
 /**
  * @brief Get GPU memory usage in bytes

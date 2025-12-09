@@ -456,10 +456,55 @@ public:
     [[nodiscard]] int32_t addSwitchingDevice(const SwitchingDeviceDescriptor& desc);
     
     /**
+     * @brief Add a meter device
+     * 
+     * @param desc Meter descriptor
+     * @return Internal index of added meter, or INVALID_INDEX on failure
+     */
+    [[nodiscard]] int32_t addMeter(const MeterDescriptor& desc);
+    
+    /**
      * @brief Get reference to network model for advanced access
      */
     [[nodiscard]] NetworkModel& getModel() { return *model_; }
     [[nodiscard]] const NetworkModel& getModel() const { return *model_; }
+
+    //=========================================================================
+    // Meter Device Management
+    //=========================================================================
+    
+    /**
+     * @brief Update a meter reading by channel
+     * 
+     * @param meter_id Meter device ID
+     * @param channel Channel name ("V", "kW", "kVAR", "A")
+     * @param value Reading value
+     * @return true on success
+     */
+    [[nodiscard]] bool updateMeterReading(const std::string& meter_id,
+                                          const std::string& channel,
+                                          Real value);
+    
+    /**
+     * @brief Get meter reading
+     */
+    [[nodiscard]] bool getMeterReading(const std::string& meter_id,
+                                       const std::string& channel,
+                                       Real& value) const;
+    
+    /**
+     * @brief Get meter estimated value (after solve)
+     */
+    [[nodiscard]] bool getMeterEstimate(const std::string& meter_id,
+                                        const std::string& channel,
+                                        Real& value) const;
+    
+    /**
+     * @brief Get meter residual (after solve)
+     */
+    [[nodiscard]] bool getMeterResidual(const std::string& meter_id,
+                                        const std::string& channel,
+                                        Real& value) const;
 
     //=========================================================================
     // Model Modification API (FR-25)
@@ -579,13 +624,26 @@ public:
     [[nodiscard]] bool updateTelemetry(const Real* values, int32_t count);
     
     /**
-     * @brief Update single measurement value
+     * @brief Update single measurement value (host memory only)
+     * 
+     * Updates the measurement value in host memory. Call syncMeasurementsToDevice()
+     * to transfer to GPU, or let solve() do it automatically.
      * 
      * @param meas_id Measurement string ID
      * @param value New value
      * @return true on success
      */
     [[nodiscard]] bool updateMeasurement(const std::string& meas_id, Real value);
+    
+    /**
+     * @brief Sync measurement values from host to GPU
+     * 
+     * Transfers all measurement values from host memory to GPU.
+     * Called automatically by solve() if not called explicitly.
+     * 
+     * @return true on success
+     */
+    [[nodiscard]] bool syncMeasurementsToDevice();
 
     //=========================================================================
     // Switching Device Control (FR-03, FR-05)
@@ -826,6 +884,7 @@ private:
     std::string config_path_;           ///< Path to loaded config file
     bool initialized_;
     bool model_uploaded_;
+    bool measurements_dirty_;           ///< True if host measurements updated but not synced to GPU
     
     // Network model (host side)
     std::unique_ptr<NetworkModel> model_;

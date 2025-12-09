@@ -195,8 +195,8 @@ void WLSSolver::freeSolverState() {
     
     // Null check for matrix_mgr_ (may be null after move)
     if (matrix_mgr_) {
-        matrix_mgr_->freeCSR(state_->H);
-        matrix_mgr_->freeCSR(state_->G);
+    matrix_mgr_->freeCSR(state_->H);
+    matrix_mgr_->freeCSR(state_->G);
     }
     
     state_.reset();
@@ -273,43 +273,43 @@ EstimationResult WLSSolver::solve(
                 state_->G_factor_valid = false;
             }
         }
+    
+    // WLS iteration loop
+    for (int32_t iter = 0; iter < max_iter && !converged && !diverged; ++iter) {
+        // Single WLS iteration
+        cudaError_t err = singleIteration(buses, branches, measurements, ybus,
+                                          config.use_robust_estimation,
+                                          config.huber_gamma);
         
-        // WLS iteration loop
-        for (int32_t iter = 0; iter < max_iter && !converged && !diverged; ++iter) {
-            // Single WLS iteration
-            cudaError_t err = singleIteration(buses, branches, measurements, ybus,
-                                              config.use_robust_estimation,
-                                              config.huber_gamma);
-            
-            if (err != cudaSuccess) {
-                result.status = ConvergenceStatus::SINGULAR_MATRIX;
+        if (err != cudaSuccess) {
+            result.status = ConvergenceStatus::SINGULAR_MATRIX;
                 diverged = true;
-                break;
-            }
-            
-            // Check convergence
-            err = checkConvergence(tolerance, converged, diverged);
-            if (err != cudaSuccess) {
-                result.status = ConvergenceStatus::DIVERGED;
+            break;
+        }
+        
+        // Check convergence
+        err = checkConvergence(tolerance, converged, diverged);
+        if (err != cudaSuccess) {
+            result.status = ConvergenceStatus::DIVERGED;
                 diverged = true;
-                break;
-            }
-            
-            result.iterations = iter + 1;
-            
-            // Check time limit for real-time mode
-            if (config.mode == EstimationMode::REALTIME && config.time_limit_ms > 0) {
-                cudaEventRecord(stop_event_, stream_);
-                cudaEventSynchronize(stop_event_);
-                float elapsed_ms;
-                cudaEventElapsedTime(&elapsed_ms, start_event_, stop_event_);
-                if (elapsed_ms > config.time_limit_ms) {
+            break;
+        }
+        
+        result.iterations = iter + 1;
+        
+        // Check time limit for real-time mode
+        if (config.mode == EstimationMode::REALTIME && config.time_limit_ms > 0) {
+            cudaEventRecord(stop_event_, stream_);
+            cudaEventSynchronize(stop_event_);
+            float elapsed_ms;
+            cudaEventElapsedTime(&elapsed_ms, start_event_, stop_event_);
+            if (elapsed_ms > config.time_limit_ms) {
                     // No time for retry in real-time mode
-                    result.status = ConvergenceStatus::MAX_ITERATIONS;
-                    break;
-                }
+                result.status = ConvergenceStatus::MAX_ITERATIONS;
+                break;
             }
         }
+    }
         
         // NFR-05: If diverged and have retry attempts left, reset to flat start
         if (diverged && retry_count < MAX_RETRY_ATTEMPTS && 

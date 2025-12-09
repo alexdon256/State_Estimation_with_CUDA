@@ -27,6 +27,12 @@
  * - Contiguous indexed arrays for GPU transfer
  * - String ID to internal index mapping
  * 
+ * Meter-Centric Design:
+ * - Meters (Voltmeters, Multimeters) are the PRIMARY source of measurement values
+ * - You don't update bus voltages directly - you update the voltmeter on that bus
+ * - You don't update branch flows directly - you update the multimeter on that branch
+ * - Meter readings flow into the underlying measurements for state estimation
+ * 
  * @note Follows JSF C++ compliance (NFR-25) with explicit constructors,
  *       [[nodiscard]] attributes, and no exceptions in hot paths.
  */
@@ -126,6 +132,9 @@ struct BranchDescriptor {
 
 /**
  * @brief Measurement definition for model initialization (FR-02)
+ * 
+ * @note Prefer using Meters (addMeter) which automatically create measurements.
+ *       Direct measurement creation is for advanced use cases.
  */
 struct MeasurementDescriptor {
     std::string id;                 ///< External string identifier
@@ -172,6 +181,68 @@ struct SwitchingDeviceDescriptor {
         : id(std::move(sd_id))
         , branch_id(std::move(br_id))
         , initial_status(status) {}
+};
+
+/**
+ * @brief Meter device types
+ * 
+ * Meters are the PRIMARY source of measurement values in the topology:
+ * - VOLTMETER: Connected to a bus via PT, provides voltage measurement
+ * - MULTIMETER: Connected to a branch via PT+CT, provides P, Q, V, I measurements
+ * - AMMETER: Connected to a branch via CT, provides current measurement
+ * - WATTMETER: Connected to a branch via PT+CT, provides P and Q measurements
+ */
+enum class MeterType {
+    VOLTMETER = 0,      ///< Voltage meter on bus (PT only)
+    MULTIMETER = 1,     ///< Multi-function meter on branch (PT + CT)
+    AMMETER = 2,        ///< Current meter on branch (CT only)
+    WATTMETER = 3       ///< Power meter on branch (PT + CT)
+};
+
+/**
+ * @brief Meter device descriptor
+ * 
+ * Represents a physical metering device in the topology.
+ * 
+ * Design philosophy:
+ * - Meters OWN measurements - they are the source of truth for measurement values
+ * - To update bus voltage, update the voltmeter connected to that bus
+ * - To update branch flows, update the multimeter on that branch
+ * - Meter readings directly affect state estimation calculations
+ */
+struct MeterDescriptor {
+    std::string id;                 ///< Meter ID (e.g., "VM1", "MM1")
+    MeterType type;                 ///< Meter type
+    std::string bus_id;             ///< Bus where meter is connected
+    std::string branch_id;          ///< Branch ID (for branch meters)
+    BranchEnd branch_end;           ///< Measurement point on branch
+    Real pt_ratio;                  ///< Potential transformer ratio
+    Real ct_ratio;                  ///< Current transformer ratio
+    Real sigma_v;                   ///< Std dev for voltage measurements
+    Real sigma_p;                   ///< Std dev for power measurements
+    Real sigma_i;                   ///< Std dev for current measurements
+    
+    explicit MeterDescriptor(
+        std::string meter_id = "",
+        MeterType t = MeterType::VOLTMETER,
+        std::string bus = "",
+        std::string branch = "",
+        BranchEnd end = BranchEnd::FROM,
+        Real pt = 1.0f,
+        Real ct = 1.0f,
+        Real sv = 0.004f,
+        Real sp = 0.01f,
+        Real si = 0.01f)
+        : id(std::move(meter_id))
+        , type(t)
+        , bus_id(std::move(bus))
+        , branch_id(std::move(branch))
+        , branch_end(end)
+        , pt_ratio(pt)
+        , ct_ratio(ct)
+        , sigma_v(sv)
+        , sigma_p(sp)
+        , sigma_i(si) {}
 };
 
 //=============================================================================
@@ -262,6 +333,30 @@ struct SwitchingDeviceElement {
         , has_pending_change(false) {}
 };
 
+/**
+ * @brief Internal meter device representation
+ * 
+ * Maps meter channels to underlying measurement indices.
+ * The meter "owns" these measurements - updating the meter updates the measurements.
+ */
+struct MeterElement {
+    int32_t index;                  ///< Internal meter index
+    MeterDescriptor descriptor;     ///< Original descriptor
+    int32_t bus_index;              ///< Resolved bus index
+    int32_t branch_index;           ///< Resolved branch index (-1 for voltmeter)
+    
+    // Measurement indices for each channel (-1 if not available)
+    int32_t meas_idx_v;             ///< Voltage measurement index
+    int32_t meas_idx_p;             ///< Active power measurement index
+    int32_t meas_idx_q;             ///< Reactive power measurement index
+    int32_t meas_idx_i;             ///< Current measurement index
+    
+    explicit MeterElement(int32_t idx = INVALID_INDEX)
+        : index(idx), bus_index(INVALID_INDEX), branch_index(INVALID_INDEX)
+        , meas_idx_v(INVALID_INDEX), meas_idx_p(INVALID_INDEX)
+        , meas_idx_q(INVALID_INDEX), meas_idx_i(INVALID_INDEX) {}
+};
+
 //=============================================================================
 // SECTION 4: Hash Map Type Definitions (Section 5.2)
 //=============================================================================
@@ -297,6 +392,13 @@ using IdIndexMap = std::unordered_map<std::string, int32_t, StringHasher>;
  * - O(1) lookup from string IDs to internal indices (Section 5.2)
  * - Pointer-stable storage using boost::stable_vector (NFR-18)
  * - Efficient GPU data transfer preparation
+ * 
+ * Meter-Centric Workflow:
+ * 1. Build topology: buses, branches
+ * 2. Add meters: voltmeters on buses, multimeters on branches
+ * 3. Update meter readings (primary telemetry input)
+ * 4. Sync to GPU and solve
+ * 5. Read estimated values from meters
  * 
  * Thread-safety: NOT thread-safe. External synchronization required.
  */
@@ -345,6 +447,7 @@ public:
     /**
      * @brief Add a measurement to the network (FR-02)
      * 
+     * @note Prefer using addMeter() which creates measurements automatically
      * @param desc Measurement descriptor
      * @return Internal index of added measurement, or INVALID_INDEX on failure
      */
@@ -359,157 +462,114 @@ public:
     [[nodiscard]] int32_t addSwitchingDevice(const SwitchingDeviceDescriptor& desc);
 
     //=========================================================================
-    // Model Modification API (FR-25)
+    // Meter Device Management (PRIMARY telemetry interface)
     //=========================================================================
     
     /**
-     * @brief Remove a bus and all connected elements
+     * @brief Add a meter device to the model
      * 
-     * @param bus_id Bus string ID
-     * @return true if removed successfully
+     * Creates the meter and its underlying measurements automatically.
+     * This is the PREFERRED way to add measurement capability to the model.
+     * 
+     * @param desc Meter descriptor
+     * @return Meter index, or INVALID_INDEX on failure
      */
+    [[nodiscard]] int32_t addMeter(const MeterDescriptor& desc);
+    
+    /**
+     * @brief Update a meter reading by channel
+     * 
+     * This is the PRIMARY way to input telemetry values.
+     * Updates flow to underlying measurements and affect state estimation.
+     * 
+     * @param meter_id Meter string ID
+     * @param channel Channel name ("V", "kW", "kVAR", "A")
+     * @param value Reading value
+     * @return true on success
+     */
+    [[nodiscard]] bool updateMeterReading(const std::string& meter_id, 
+                                          const std::string& channel, 
+                                          Real value);
+    
+    /**
+     * @brief Get meter reading by channel
+     */
+    [[nodiscard]] bool getMeterReading(const std::string& meter_id,
+                                       const std::string& channel,
+                                       Real& value) const;
+    
+    /**
+     * @brief Get meter estimated value by channel (after solve)
+     */
+    [[nodiscard]] bool getMeterEstimate(const std::string& meter_id,
+                                        const std::string& channel,
+                                        Real& value) const;
+    
+    /**
+     * @brief Get meter residual by channel (after solve)
+     */
+    [[nodiscard]] bool getMeterResidual(const std::string& meter_id,
+                                        const std::string& channel,
+                                        Real& value) const;
+
+    //=========================================================================
+    // Model Modification API (FR-25)
+    //=========================================================================
+    
     [[nodiscard]] bool removeBus(const std::string& bus_id);
-    
-    /**
-     * @brief Remove a branch
-     * 
-     * @param branch_id Branch string ID
-     * @return true if removed successfully
-     */
     [[nodiscard]] bool removeBranch(const std::string& branch_id);
-    
-    /**
-     * @brief Update branch parameters
-     * 
-     * @param branch_id Branch string ID
-     * @param desc New branch descriptor
-     * @return true if updated successfully
-     */
     [[nodiscard]] bool updateBranch(const std::string& branch_id,
                                      const BranchDescriptor& desc);
     
-    /**
-     * @brief Mark model as modified (triggers full cycle)
-     */
     void markModified() { model_modified_ = true; }
-    
-    /**
-     * @brief Check if model has structural modifications
-     */
     [[nodiscard]] bool isModified() const { return model_modified_; }
-    
-    /**
-     * @brief Clear modification flag after handling
-     */
     void clearModified() { model_modified_ = false; }
 
     //=========================================================================
     // Index Lookup API (Section 5.2)
     //=========================================================================
     
-    /**
-     * @brief Get bus index from string ID
-     * 
-     * @param id Bus string ID
-     * @return Internal index or INVALID_INDEX if not found
-     */
     [[nodiscard]] int32_t getBusIndex(const std::string& id) const;
-    
-    /**
-     * @brief Get branch index from string ID
-     */
     [[nodiscard]] int32_t getBranchIndex(const std::string& id) const;
-    
-    /**
-     * @brief Get measurement index from string ID
-     */
     [[nodiscard]] int32_t getMeasurementIndex(const std::string& id) const;
-    
-    /**
-     * @brief Get switching device index from string ID
-     */
     [[nodiscard]] int32_t getSwitchingDeviceIndex(const std::string& id) const;
+    [[nodiscard]] int32_t getMeterIndex(const std::string& id) const;
 
     //=========================================================================
     // Element Access
     //=========================================================================
     
-    /**
-     * @brief Get number of buses
-     */
-    [[nodiscard]] int32_t getBusCount() const { 
-        return static_cast<int32_t>(buses_.size()); 
-    }
-    
-    /**
-     * @brief Get number of branches
-     */
-    [[nodiscard]] int32_t getBranchCount() const { 
-        return static_cast<int32_t>(branches_.size()); 
-    }
-    
-    /**
-     * @brief Get number of measurements
-     */
-    [[nodiscard]] int32_t getMeasurementCount() const { 
-        return static_cast<int32_t>(measurements_.size()); 
-    }
-    
-    /**
-     * @brief Get number of switching devices
-     */
-    [[nodiscard]] int32_t getSwitchingDeviceCount() const { 
-        return static_cast<int32_t>(switching_devices_.size()); 
-    }
-    
-    /**
-     * @brief Get slack bus index
-     */
+    [[nodiscard]] int32_t getBusCount() const { return static_cast<int32_t>(buses_.size()); }
+    [[nodiscard]] int32_t getBranchCount() const { return static_cast<int32_t>(branches_.size()); }
+    [[nodiscard]] int32_t getMeasurementCount() const { return static_cast<int32_t>(measurements_.size()); }
+    [[nodiscard]] int32_t getSwitchingDeviceCount() const { return static_cast<int32_t>(switching_devices_.size()); }
+    [[nodiscard]] int32_t getMeterCount() const { return static_cast<int32_t>(meters_.size()); }
     [[nodiscard]] int32_t getSlackBusIndex() const { return slack_bus_index_; }
     
-    /**
-     * @brief Get bus element by index
-     */
     [[nodiscard]] BusElement* getBus(int32_t index);
     [[nodiscard]] const BusElement* getBus(int32_t index) const;
-    
-    /**
-     * @brief Get branch element by index
-     */
     [[nodiscard]] BranchElement* getBranch(int32_t index);
     [[nodiscard]] const BranchElement* getBranch(int32_t index) const;
-    
-    /**
-     * @brief Get measurement element by index
-     */
     [[nodiscard]] MeasurementElement* getMeasurement(int32_t index);
     [[nodiscard]] const MeasurementElement* getMeasurement(int32_t index) const;
-    
-    /**
-     * @brief Get switching device by index
-     */
     [[nodiscard]] SwitchingDeviceElement* getSwitchingDevice(int32_t index);
     [[nodiscard]] const SwitchingDeviceElement* getSwitchingDevice(int32_t index) const;
+    [[nodiscard]] MeterElement* getMeter(int32_t index);
+    [[nodiscard]] const MeterElement* getMeter(int32_t index) const;
 
     //=========================================================================
-    // Telemetry Update (FR-07)
+    // Telemetry Update (FR-07) - Low-level interface
     //=========================================================================
     
     /**
-     * @brief Update measurement values (real-time telemetry)
-     * 
-     * @param values Array of new measurement values
-     * @param count Number of values
-     * @return true if update successful
+     * @brief Update measurement values (real-time telemetry) - bulk update
+     * @note Prefer updateMeterReading() for meter-centric workflow
      */
     [[nodiscard]] bool updateMeasurementValues(const Real* values, int32_t count);
     
     /**
-     * @brief Update single measurement value
-     * 
-     * @param meas_id Measurement string ID
-     * @param value New value
-     * @return true if update successful
+     * @brief Update single measurement value - low-level
+     * @note Prefer updateMeterReading() for meter-centric workflow
      */
     [[nodiscard]] bool updateMeasurementValue(const std::string& meas_id, Real value);
 
@@ -517,94 +577,28 @@ public:
     // GPU Data Preparation
     //=========================================================================
     
-    /**
-     * @brief Pack bus data into host SoA structure for GPU transfer
-     * 
-     * @param data Pre-allocated host bus data structure
-     */
     void packBusData(HostBusData& data) const;
-    
-    /**
-     * @brief Pack branch data into host SoA structure
-     * 
-     * @param data Pre-allocated host branch data structure
-     */
     void packBranchData(HostBranchData& data) const;
-    
-    /**
-     * @brief Pack measurement data into host SoA structure
-     * 
-     * @param data Pre-allocated host measurement data structure
-     */
     void packMeasurementData(HostMeasurementData& data) const;
-    
-    /**
-     * @brief Pack switching device data into host SoA structure
-     */
     void packSwitchingDeviceData(HostSwitchingDeviceData& data) const;
-    
-    /**
-     * @brief Calculate total memory required for GPU data
-     */
     [[nodiscard]] size_t calculateGPUMemoryRequired() const;
 
     //=========================================================================
     // Validation
     //=========================================================================
     
-    /**
-     * @brief Validate model integrity
-     * 
-     * Checks:
-     * - All bus references are valid
-     * - At least one slack bus exists
-     * - No isolated buses (warning)
-     * - Measurement locations exist
-     * 
-     * @return true if model is valid
-     */
     [[nodiscard]] bool validate() const;
-    
-    /**
-     * @brief Compute branch admittances from impedances
-     * 
-     * Calculates g_series, b_series, b_shunt for all branches.
-     * Called after model building or modification.
-     */
     void computeBranchAdmittances();
-    
-    /**
-     * @brief Apply flat start initialization (1.0 p.u., 0 deg)
-     */
     void applyFlatStart();
     
     //=========================================================================
     // Result Setters (for GPU result download)
     //=========================================================================
     
-    /**
-     * @brief Set bus voltage results from GPU
-     */
     void setBusVoltage(int32_t index, Real v_mag, Real v_angle);
-    
-    /**
-     * @brief Set bus power injection results from GPU
-     */
     void setBusPower(int32_t index, Real p_inj, Real q_inj);
-    
-    /**
-     * @brief Set branch flow results from GPU
-     */
     void setBranchFlows(int32_t index, Real p_from, Real q_from, Real p_to, Real q_to);
-    
-    /**
-     * @brief Set branch current results from GPU
-     */
     void setBranchCurrents(int32_t index, Real i_from, Real i_to);
-    
-    /**
-     * @brief Set measurement result (estimated and residual) from GPU
-     */
     void setMeasurementResult(int32_t index, Real estimated, Real residual);
 
 private:
@@ -613,12 +607,14 @@ private:
     boost::container::stable_vector<BranchElement> branches_;
     boost::container::stable_vector<MeasurementElement> measurements_;
     boost::container::stable_vector<SwitchingDeviceElement> switching_devices_;
+    boost::container::stable_vector<MeterElement> meters_;
     
     // String ID to index maps (Section 5.2)
     IdIndexMap bus_id_map_;
     IdIndexMap branch_id_map_;
     IdIndexMap measurement_id_map_;
     IdIndexMap sd_id_map_;
+    IdIndexMap meter_id_map_;
     
     // Model state
     int32_t slack_bus_index_;
@@ -637,71 +633,28 @@ private:
 /**
  * @class HostDataAllocator
  * @brief Allocates and manages pinned memory for host SoA structures
- * 
- * Uses CUDA pinned memory (page-locked) for efficient DMA transfers (FR-06).
- * Provides RAII-style memory management.
  */
 class HostDataAllocator {
 public:
     HostDataAllocator();
     ~HostDataAllocator();
     
-    // Disable copy
     HostDataAllocator(const HostDataAllocator&) = delete;
     HostDataAllocator& operator=(const HostDataAllocator&) = delete;
     
-    /**
-     * @brief Allocate host bus data arrays
-     * 
-     * @param data Structure to populate with allocated pointers
-     * @param count Number of buses
-     * @return cudaSuccess on success
-     */
     [[nodiscard]] cudaError_t allocateBusData(HostBusData& data, int32_t count);
-    
-    /**
-     * @brief Free host bus data arrays
-     */
     void freeBusData(HostBusData& data);
-    
-    /**
-     * @brief Allocate host branch data arrays
-     */
     [[nodiscard]] cudaError_t allocateBranchData(HostBranchData& data, int32_t count);
-    
-    /**
-     * @brief Free host branch data arrays
-     */
     void freeBranchData(HostBranchData& data);
-    
-    /**
-     * @brief Allocate host measurement data arrays
-     */
-    [[nodiscard]] cudaError_t allocateMeasurementData(HostMeasurementData& data, 
-                                                       int32_t count);
-    
-    /**
-     * @brief Free host measurement data arrays
-     */
+    [[nodiscard]] cudaError_t allocateMeasurementData(HostMeasurementData& data, int32_t count);
     void freeMeasurementData(HostMeasurementData& data);
-    
-    /**
-     * @brief Allocate host switching device data arrays
-     */
-    [[nodiscard]] cudaError_t allocateSwitchingDeviceData(HostSwitchingDeviceData& data,
-                                                           int32_t count);
-    
-    /**
-     * @brief Free host switching device data arrays
-     */
+    [[nodiscard]] cudaError_t allocateSwitchingDeviceData(HostSwitchingDeviceData& data, int32_t count);
     void freeSwitchingDeviceData(HostSwitchingDeviceData& data);
 
 private:
-    // Track allocations for cleanup
     std::vector<void*> allocations_;
 };
 
 } // namespace sle
 
 #endif // NETWORK_MODEL_H
-

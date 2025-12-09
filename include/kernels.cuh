@@ -158,32 +158,41 @@ __global__ void computeBranchCurrentsKernel(
 /**
  * @brief Compute measurement function h(x) for all measurements
  * 
- * Evaluates the estimated measurement value based on measurement type:
- * - V_MAG: h(x) = V_i / pt_ratio
+ * Evaluates the estimated measurement value based on measurement type.
+ * All values are in per-unit (p.u.) - NO PT/CT scaling applied:
+ * - V_MAG: h(x) = V_i
  * - V_ANGLE: h(x) = theta_i
- * - P_INJECTION: h(x) = P_inj_i / (pt_ratio * ct_ratio)
- * - Q_INJECTION: h(x) = Q_inj_i / (pt_ratio * ct_ratio)
- * - P_FLOW: h(x) = P_flow_k / (pt_ratio * ct_ratio)
- * - Q_FLOW: h(x) = Q_flow_k / (pt_ratio * ct_ratio)
- * - I_MAG: h(x) = I_mag_k / ct_ratio
+ * - P_INJECTION: h(x) = P_inj_i
+ * - Q_INJECTION: h(x) = Q_inj_i
+ * - P_FLOW: h(x) = P_flow_k
+ * - Q_FLOW: h(x) = Q_flow_k
+ * - I_MAG: h(x) = I_mag_k
+ * - P_PSEUDO, Q_PSEUDO: h(x) = P/Q_inj
+ * 
+ * Convention:
+ * - All measurements and states are in per-unit (p.u.)
+ * - User provides meter readings in p.u.
+ * - residual = z_measured - h(x)
+ * - PT/CT ratios in kernel signature are reserved for future calibration features
+ * - For meters on transformers: bus voltage already includes tap ratio effect
  * 
  * @param h_values Output estimated values [n_meas]
  * @param meas_type Measurement types [n_meas]
  * @param location_index Location indices [n_meas]
  * @param branch_end Branch end indicators [n_meas]
- * @param pt_ratio PT ratios [n_meas]
- * @param ct_ratio CT ratios [n_meas]
+ * @param pt_ratio PT ratios [n_meas] (currently unused, reserved for calibration)
+ * @param ct_ratio CT ratios [n_meas] (currently unused, reserved for calibration)
  * @param is_active Active flags [n_meas]
- * @param v_mag Bus voltage magnitudes [n_buses]
- * @param v_angle Bus voltage angles [n_buses]
- * @param p_inj Bus power injections [n_buses]
- * @param q_inj Bus reactive injections [n_buses]
- * @param p_flow_from Branch P flows from end [n_branches]
- * @param q_flow_from Branch Q flows from end [n_branches]
- * @param p_flow_to Branch P flows to end [n_branches]
- * @param q_flow_to Branch Q flows to end [n_branches]
- * @param i_mag_from Branch I magnitudes from end [n_branches]
- * @param i_mag_to Branch I magnitudes to end [n_branches]
+ * @param v_mag Bus voltage magnitudes [n_buses] (p.u.)
+ * @param v_angle Bus voltage angles [n_buses] (radians)
+ * @param p_inj Bus power injections [n_buses] (p.u.)
+ * @param q_inj Bus reactive injections [n_buses] (p.u.)
+ * @param p_flow_from Branch P flows from end [n_branches] (p.u.)
+ * @param q_flow_from Branch Q flows from end [n_branches] (p.u.)
+ * @param p_flow_to Branch P flows to end [n_branches] (p.u.)
+ * @param q_flow_to Branch Q flows to end [n_branches] (p.u.)
+ * @param i_mag_from Branch I magnitudes from end [n_branches] (p.u.)
+ * @param i_mag_to Branch I magnitudes to end [n_branches] (p.u.)
  * @param n_meas Number of measurements
  */
 __global__ void computeMeasurementFunctionKernel(

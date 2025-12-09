@@ -45,6 +45,7 @@ SLEEngine::SLEEngine()
     , config_path_(ConfigLoader::getDefaultConfigPath())
     , initialized_(false)
     , model_uploaded_(false)
+    , measurements_dirty_(false)
     , model_(std::make_unique<NetworkModel>())
     , device_mgr_(nullptr)
     , solver_(nullptr)
@@ -61,6 +62,7 @@ SLEEngine::SLEEngine(const EngineConfig& config)
     , config_path_("")  // No file path when using explicit config
     , initialized_(false)
     , model_uploaded_(false)
+    , measurements_dirty_(false)
     , model_(std::make_unique<NetworkModel>())
     , device_mgr_(nullptr)
     , solver_(nullptr)
@@ -76,6 +78,7 @@ SLEEngine::SLEEngine(const std::string& config_path)
     , config_path_(config_path)
     , initialized_(false)
     , model_uploaded_(false)
+    , measurements_dirty_(false)
     , model_(std::make_unique<NetworkModel>())
     , device_mgr_(nullptr)
     , solver_(nullptr)
@@ -268,6 +271,45 @@ int32_t SLEEngine::addSwitchingDevice(const SwitchingDeviceDescriptor& desc) {
     return model_->addSwitchingDevice(desc);
 }
 
+int32_t SLEEngine::addMeter(const MeterDescriptor& desc) {
+    if (!model_) return INVALID_INDEX;
+    
+    model_->markModified();
+    return model_->addMeter(desc);
+}
+
+bool SLEEngine::updateMeterReading(const std::string& meter_id,
+                                   const std::string& channel,
+                                   Real value) {
+    if (!model_) return false;
+    if (model_->updateMeterReading(meter_id, channel, value)) {
+        measurements_dirty_ = true;
+        return true;
+    }
+    return false;
+}
+
+bool SLEEngine::getMeterReading(const std::string& meter_id,
+                                const std::string& channel,
+                                Real& value) const {
+    if (!model_) return false;
+    return model_->getMeterReading(meter_id, channel, value);
+}
+
+bool SLEEngine::getMeterEstimate(const std::string& meter_id,
+                                 const std::string& channel,
+                                 Real& value) const {
+    if (!model_) return false;
+    return model_->getMeterEstimate(meter_id, channel, value);
+}
+
+bool SLEEngine::getMeterResidual(const std::string& meter_id,
+                                 const std::string& channel,
+                                 Real& value) const {
+    if (!model_) return false;
+    return model_->getMeterResidual(meter_id, channel, value);
+}
+
 bool SLEEngine::removeBus(const std::string& bus_id) {
     if (!model_) return false;
     
@@ -437,6 +479,7 @@ bool SLEEngine::uploadModel() {
     
     model_->clearModified();
     model_uploaded_ = true;
+    measurements_dirty_ = false;  // Model upload includes measurement values
     
     return true;
 }
@@ -461,12 +504,49 @@ bool SLEEngine::updateTelemetry(const Real* values, int32_t count) {
     
     // Transfer to GPU
     cudaError_t err = device_mgr_->updateMeasurements(values, count);
-    return err == cudaSuccess;
+    if (err == cudaSuccess) {
+        measurements_dirty_ = false;  // GPU is now in sync
+        return true;
+    }
+    return false;
 }
 
 bool SLEEngine::updateMeasurement(const std::string& meas_id, Real value) {
     if (!model_) return false;
-    return model_->updateMeasurementValue(meas_id, value);
+    if (model_->updateMeasurementValue(meas_id, value)) {
+        measurements_dirty_ = true;
+        return true;
+    }
+    return false;
+}
+
+bool SLEEngine::syncMeasurementsToDevice() {
+    if (!model_ || !device_mgr_ || !model_uploaded_) {
+        return false;
+    }
+    
+    // Collect all measurement values from host model
+    int32_t count = model_->getMeasurementCount();
+    if (count == 0) {
+        measurements_dirty_ = false;
+        return true;
+    }
+    
+    std::vector<Real> values(count);
+    for (int32_t i = 0; i < count; ++i) {
+        const MeasurementElement* elem = model_->getMeasurement(i);
+        if (elem) {
+            values[i] = elem->value;
+        }
+    }
+    
+    // Transfer to GPU
+    cudaError_t err = device_mgr_->updateMeasurements(values.data(), count);
+    if (err == cudaSuccess) {
+        measurements_dirty_ = false;
+        return true;
+    }
+    return false;
 }
 
 //=============================================================================
@@ -554,6 +634,12 @@ EstimationResult SLEEngine::solve(const SolverConfig& config) {
             result.status = ConvergenceStatus::SINGULAR_MATRIX;
             return result;
         }
+    }
+    
+    // Auto-sync measurements if dirty (meter/measurement updates pending)
+    // This ensures meter readings flow to GPU before estimation
+    if (measurements_dirty_) {
+        syncMeasurementsToDevice();
     }
     
     // Run WLS solver

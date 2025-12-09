@@ -561,7 +561,7 @@ cudaError_t SparseMatrixManager::buildYbus(
     if (ybus.d_col_ind) cudaFree(ybus.d_col_ind);
     if (ybus.d_g_values) cudaFree(ybus.d_g_values);
     if (ybus.d_b_values) cudaFree(ybus.d_b_values);
-    
+        
     cudaMalloc(&ybus.d_col_ind, total_nnz * sizeof(int32_t));
     cudaMalloc(&ybus.d_g_values, total_nnz * sizeof(Real));
     cudaMalloc(&ybus.d_b_values, total_nnz * sizeof(Real));
@@ -1158,8 +1158,8 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     // Create H^T matrix descriptor (cols x rows)
     sparse_err = cusparseCreateCsr(&matHT, H.cols, H.rows, compact_nnz,
                                    d_HT_row_ptr, d_HT_col_ind, d_HT_values,
-                                   CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                   CUSPARSE_INDEX_BASE_ZERO, data_type);
+                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                      CUSPARSE_INDEX_BASE_ZERO, data_type);
     if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
         cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
@@ -1232,10 +1232,10 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     void* d_buffer1;
     cuda_err = cudaMalloc(&d_buffer1, buffer1_size);
     if (cuda_err != cudaSuccess) {
-        cusparseSpGEMM_destroyDescr(spgemmDesc);
+    cusparseSpGEMM_destroyDescr(spgemmDesc);
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
-        cusparseDestroySpMat(matG);
+    cusparseDestroySpMat(matG);
         cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
@@ -1654,9 +1654,11 @@ __global__ void computeJacobianValuesKernel(
     
     MeasurementType type = meas_type[m];
     int32_t loc = location_index[m];
-    // Safeguard against division by zero
-    Real pt = fmaxf(pt_ratio[m], SLE_REAL_EPSILON);
-    Real ct = fmaxf(ct_ratio[m], SLE_REAL_EPSILON);
+    
+    // PT/CT ratios are NOT used in Jacobian computation.
+    // All values in p.u., consistent with measurement function.
+    (void)pt_ratio;  // Unused - reserved for future calibration
+    (void)ct_ratio;  // Unused - reserved for future calibration
     
     // Helper lambda to convert bus index to angle state index
     // Returns -1 if bus is slack (no angle state)
@@ -1674,10 +1676,10 @@ __global__ void computeJacobianValuesKernel(
     
     switch (type) {
         case MeasurementType::V_MAG: {
-            // dh/dV_i = 1/pt_ratio
+            // dh/dV_i = 1.0 (since h = V)
             int32_t state_idx = vmag_state_idx(loc);
             H_col_ind[h_idx] = state_idx;
-            H_values[h_idx] = 1.0f / pt;
+            H_values[h_idx] = 1.0f;
             break;
         }
         
@@ -1694,7 +1696,7 @@ __global__ void computeJacobianValuesKernel(
         case MeasurementType::P_INJECTION: {
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
-            Real scale = 1.0f / (pt * ct);
+            Real scale = 1.0f;  // No PT/CT scaling - all values in p.u.
             
             int32_t ybus_start = ybus_row_ptr[loc];
             int32_t ybus_end = ybus_row_ptr[loc + 1];
@@ -1761,7 +1763,7 @@ __global__ void computeJacobianValuesKernel(
         case MeasurementType::Q_INJECTION: {
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
-            Real scale = 1.0f / (pt * ct);
+            Real scale = 1.0f;  // No PT/CT scaling - all values in p.u.
             
             int32_t ybus_start = ybus_row_ptr[loc];
             int32_t ybus_end = ybus_row_ptr[loc + 1];
@@ -1842,7 +1844,7 @@ __global__ void computeJacobianValuesKernel(
             Real theta_ij = theta_i - theta_j - phi;
             Real cos_t = cosf(theta_ij);
             Real sin_t = sinf(theta_ij);
-            Real scale = 1.0f / (pt * ct);
+            Real scale = 1.0f;  // No PT/CT scaling - all values in p.u.
             Real a2 = a * a;
             Real inv_a = 1.0f / a;
             
@@ -2052,8 +2054,8 @@ __global__ void computeJacobianValuesKernel(
             Real inv_a = 1.0f / a;
             
             // Approximate: dI/dθ ≈ I/P * dP/dθ, dI/dV ≈ I/P * dP/dV - I/V
-            // Use unit scale for now
-            Real scale = 1.0f / ct;
+            // No PT/CT scaling - all values in p.u.
+            Real scale = 1.0f;
             
             Real dI_dVi, dI_dVj, dI_dtheta_i, dI_dtheta_j;
             

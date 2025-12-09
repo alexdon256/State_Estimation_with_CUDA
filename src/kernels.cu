@@ -400,57 +400,70 @@ __global__ void computeMeasurementFunctionKernel(
     MeasurementType type = meas_type[m];
     int32_t loc = location_index[m];
     BranchEnd end = branch_end[m];
-    // Safeguard against division by zero: clamp ratios to minimum value
-    Real pt = fmaxf(pt_ratio[m], SLE_REAL_EPSILON);
-    Real ct = fmaxf(ct_ratio[m], SLE_REAL_EPSILON);
+    
+    // PT/CT ratios are NOT used in h(x) computation.
+    // All measurements and states are in per-unit (p.u.).
+    // 
+    // Rationale:
+    // - User provides meter readings directly in p.u.
+    // - h(x) returns estimated system values in p.u.
+    // - residual = z - h(x) compares like with like
+    // - PT/CT ratios (if needed) can affect measurement weight (sigma) instead
+    //
+    // For meters on power transformers:
+    // - The bus voltage already includes tap ratio effect (via Ybus)
+    // - No additional scaling needed
+    //
+    // (PT/CT parameters kept in kernel signature for future calibration features)
+    (void)pt_ratio;  // Unused - reserved for future calibration
+    (void)ct_ratio;  // Unused - reserved for future calibration
     
     Real h = 0.0f;
     
     // Compute h(x) based on measurement type
-    // Using switch with explicit enumeration for compiler optimization
+    // All values in per-unit (p.u.) - standard power system convention
     switch (type) {
         case MeasurementType::V_MAG:
-            // h(x) = V_i / pt_ratio
-            h = v_mag[loc] / pt;
+            // h(x) = V_i (p.u.)
+            h = v_mag[loc];
             break;
             
         case MeasurementType::V_ANGLE:
-            // h(x) = theta_i (no scaling for angle)
+            // h(x) = theta_i (radians)
             h = v_angle[loc];
             break;
             
         case MeasurementType::P_INJECTION:
-            // h(x) = P_inj_i / (pt * ct)
-            h = p_inj[loc] / (pt * ct);
+            // h(x) = P_inj_i (p.u.)
+            h = p_inj[loc];
             break;
             
         case MeasurementType::Q_INJECTION:
-            // h(x) = Q_inj_i / (pt * ct)
-            h = q_inj[loc] / (pt * ct);
+            // h(x) = Q_inj_i (p.u.)
+            h = q_inj[loc];
             break;
             
         case MeasurementType::P_FLOW:
-            // h(x) = P_flow at specified end
+            // h(x) = P_flow at specified end (p.u.)
             h = (end == BranchEnd::FROM) ? 
                 p_flow_from[loc] : p_flow_to[loc];
-            h /= (pt * ct);
             break;
             
         case MeasurementType::Q_FLOW:
+            // h(x) = Q_flow at specified end (p.u.)
             h = (end == BranchEnd::FROM) ? 
                 q_flow_from[loc] : q_flow_to[loc];
-            h /= (pt * ct);
             break;
             
         case MeasurementType::I_MAG:
+            // h(x) = I_mag at specified end (p.u.)
             h = (end == BranchEnd::FROM) ? 
                 i_mag_from[loc] : i_mag_to[loc];
-            h /= ct;
             break;
             
         case MeasurementType::P_PSEUDO:
         case MeasurementType::Q_PSEUDO:
-            // Pseudo measurements use injection values
+            // Pseudo measurements use injection values (p.u.)
             h = (type == MeasurementType::P_PSEUDO) ? 
                 p_inj[loc] : q_inj[loc];
             break;

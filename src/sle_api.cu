@@ -600,6 +600,144 @@ SLE_API SLE_Real SLE_CALL sle_GetTransformerPhaseShift(SLE_Handle handle, const 
 }
 
 //=============================================================================
+// Meter Device Management
+//=============================================================================
+
+SLE_API SLE_StatusCode SLE_CALL sle_AddMeter(SLE_Handle handle, const SLE_MeterInfo* info) {
+    if (!handle || !info || !info->id || !info->bus_id) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    
+    MeterDescriptor desc;
+    desc.id = info->id;
+    desc.type = static_cast<MeterType>(info->type);
+    desc.bus_id = info->bus_id;
+    desc.branch_id = info->branch_id ? info->branch_id : "";
+    desc.branch_end = static_cast<BranchEnd>(info->branch_end);
+    desc.pt_ratio = info->pt_ratio;
+    desc.ct_ratio = info->ct_ratio;
+    desc.sigma_v = info->sigma_v;
+    desc.sigma_p = info->sigma_p;
+    desc.sigma_i = info->sigma_i;
+    
+    if (engine->addMeter(desc) != INVALID_INDEX) {
+        return SLE_OK;
+    }
+    
+    last_error_message = "Failed to add meter: check bus/branch IDs";
+    return SLE_ERROR_ELEMENT_NOT_FOUND;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeterReading(SLE_Handle handle,
+                                                        const char* meter_id,
+                                                        const char* channel,
+                                                        SLE_Real value) {
+    if (!handle || !meter_id || !channel) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    if (engine->updateMeterReading(meter_id, channel, value)) {
+        return SLE_OK;
+    }
+    
+    last_error_message = "Meter or channel not found: " + std::string(meter_id) + "." + channel;
+    return SLE_ERROR_ELEMENT_NOT_FOUND;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeterReadings(SLE_Handle handle,
+                                                         const SLE_MeterReading* readings,
+                                                         int32_t count,
+                                                         int32_t sync_to_device) {
+    if (!handle || !readings || count <= 0) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    
+    // Update all readings
+    for (int32_t i = 0; i < count; ++i) {
+        if (!readings[i].meter_id || !readings[i].channel) {
+            last_error_message = "Null meter_id or channel at index " + std::to_string(i);
+            return SLE_ERROR_INVALID_ARGUMENT;
+        }
+        if (!engine->updateMeterReading(readings[i].meter_id, 
+                                        readings[i].channel, 
+                                        readings[i].value)) {
+            last_error_message = "Meter or channel not found: " + 
+                std::string(readings[i].meter_id) + "." + readings[i].channel;
+            return SLE_ERROR_ELEMENT_NOT_FOUND;
+        }
+    }
+    
+    // Optionally sync to GPU
+    if (sync_to_device) {
+        if (!engine->syncMeasurementsToDevice()) {
+            last_error_message = "Failed to sync to device";
+            return SLE_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    
+    return SLE_OK;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeterReading(SLE_Handle handle,
+                                                     const char* meter_id,
+                                                     const char* channel,
+                                                     SLE_Real* value) {
+    if (!handle || !meter_id || !channel || !value) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    Real v;
+    if (engine->getMeterReading(meter_id, channel, v)) {
+        *value = v;
+        return SLE_OK;
+    }
+    
+    return SLE_ERROR_ELEMENT_NOT_FOUND;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeterEstimate(SLE_Handle handle,
+                                                      const char* meter_id,
+                                                      const char* channel,
+                                                      SLE_Real* value) {
+    if (!handle || !meter_id || !channel || !value) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    Real v;
+    if (engine->getMeterEstimate(meter_id, channel, v)) {
+        *value = v;
+        return SLE_OK;
+    }
+    
+    return SLE_ERROR_ELEMENT_NOT_FOUND;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeterResidual(SLE_Handle handle,
+                                                      const char* meter_id,
+                                                      const char* channel,
+                                                      SLE_Real* residual) {
+    if (!handle || !meter_id || !channel || !residual) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    Real v;
+    if (engine->getMeterResidual(meter_id, channel, v)) {
+        *residual = v;
+        return SLE_OK;
+    }
+    
+    return SLE_ERROR_ELEMENT_NOT_FOUND;
+}
+
+//=============================================================================
 // GPU Data Management
 //=============================================================================
 
@@ -646,6 +784,117 @@ SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeasurement(SLE_Handle handle,
     }
     
     return SLE_ERROR_ELEMENT_NOT_FOUND;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_UpdateMeasurementBatch(SLE_Handle handle,
+                                                            const SLE_MeasurementUpdate* updates,
+                                                            int32_t count,
+                                                            int32_t sync_to_device) {
+    if (!handle || !updates || count <= 0) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    
+    // Update all measurements in host memory
+    for (int32_t i = 0; i < count; ++i) {
+        if (!updates[i].meas_id) {
+            last_error_message = "Null measurement ID at index " + std::to_string(i);
+            return SLE_ERROR_INVALID_ARGUMENT;
+        }
+        if (!engine->updateMeasurement(updates[i].meas_id, updates[i].value)) {
+            last_error_message = "Measurement not found: " + std::string(updates[i].meas_id);
+            return SLE_ERROR_ELEMENT_NOT_FOUND;
+        }
+    }
+    
+    // Optionally sync to GPU
+    if (sync_to_device) {
+        if (!engine->syncMeasurementsToDevice()) {
+            last_error_message = "Failed to sync measurements to device";
+            return SLE_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    
+    return SLE_OK;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_SyncMeasurementsToDevice(SLE_Handle handle) {
+    if (!handle) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    if (engine->syncMeasurementsToDevice()) {
+        return SLE_OK;
+    }
+    
+    last_error_message = "Failed to sync measurements to device";
+    return SLE_ERROR_OUT_OF_MEMORY;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_GetMeasurementDetails(SLE_Handle handle,
+                                                           const char* meas_id,
+                                                           SLE_MeasurementDetails* details) {
+    if (!handle || !meas_id || !details) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    const NetworkModel& model = engine->getModel();
+    
+    int32_t idx = model.getMeasurementIndex(meas_id);
+    if (idx == INVALID_INDEX) {
+        return SLE_ERROR_ELEMENT_NOT_FOUND;
+    }
+    
+    const MeasurementElement* elem = model.getMeasurement(idx);
+    if (!elem) {
+        return SLE_ERROR_ELEMENT_NOT_FOUND;
+    }
+    
+    // Thread-local storage for string IDs (valid until next call)
+    static thread_local std::string s_meas_id;
+    static thread_local std::string s_location_id;
+    
+    s_meas_id = elem->descriptor.id;
+    s_location_id = elem->descriptor.location_id;
+    
+    details->id = s_meas_id.c_str();
+    details->type = static_cast<SLE_MeasurementType>(elem->descriptor.type);
+    details->location_id = s_location_id.c_str();
+    details->branch_end = static_cast<SLE_BranchEnd>(elem->descriptor.branch_end);
+    details->sigma = elem->descriptor.sigma;
+    details->pt_ratio = elem->descriptor.pt_ratio;
+    details->ct_ratio = elem->descriptor.ct_ratio;
+    details->is_pseudo = elem->descriptor.is_pseudo ? 1 : 0;
+    details->internal_index = elem->index;
+    details->current_value = elem->value;
+    details->estimated_value = elem->estimated;
+    details->residual = elem->residual;
+    details->is_active = elem->is_active ? 1 : 0;
+    
+    return SLE_OK;
+}
+
+SLE_API const char* SLE_CALL sle_GetMeasurementIdByIndex(SLE_Handle handle, int32_t index) {
+    if (!handle || index < 0) {
+        return nullptr;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    const NetworkModel& model = engine->getModel();
+    
+    const MeasurementElement* elem = model.getMeasurement(index);
+    if (!elem) {
+        return nullptr;
+    }
+    
+    // Thread-local storage for the ID string (valid until next call from same thread)
+    static thread_local std::string s_meas_id;
+    s_meas_id = elem->descriptor.id;
+    
+    return s_meas_id.c_str();
 }
 
 //=============================================================================
@@ -966,6 +1215,13 @@ SLE_API int32_t SLE_CALL sle_GetMeasurementCount(SLE_Handle handle) {
     
     SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
     return engine->getModel().getMeasurementCount();
+}
+
+SLE_API int32_t SLE_CALL sle_GetMeterCount(SLE_Handle handle) {
+    if (!handle) return 0;
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    return engine->getModel().getMeterCount();
 }
 
 SLE_API size_t SLE_CALL sle_GetGPUMemoryUsage(SLE_Handle handle) {

@@ -614,7 +614,7 @@ static __global__ void jacobianVmagOptimizedKernel(
         int bus_idx = s_loc_idx[tid];
         Real pt = s_pt_ratio[tid];
         
-        // dh/dV_i = 1/pt, dh/dtheta_i = 0
+        // dh/dV_i = 1.0 (no PT/CT scaling), dh/dtheta_i = 0
         int row_start = H_row_ptr[meas_row];
         
         // Find the column corresponding to V magnitude of bus_idx
@@ -622,9 +622,11 @@ static __global__ void jacobianVmagOptimizedKernel(
         
         // Set the Jacobian value
         // Note: This assumes the pattern is already set correctly
+        // PT ratio loaded but not used - reserved for future calibration features
+        (void)pt;
         for (int idx = row_start; idx < H_row_ptr[meas_row + 1]; ++idx) {
             if (H_col_ind[idx] == mag_col) {
-                H_values[idx] = 1.0f / pt;
+                H_values[idx] = 1.0f;  // All values in p.u.
                 break;
             }
         }
