@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{13B4F6FE-4D88-AF15-B4CB-C2388A2DD93D}</ProjectGuid>
+    <RootNamespace>SLE</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  
+  <!-- Debug Configuration -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  
+  <!-- Release Configuration -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 12.6.props" />
+  </ImportGroup>
+  
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  
+  <PropertyGroup Label="UserMacros" />
+  
+  <!-- Output and Intermediate Directories -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LinkIncremental>true</LinkIncremental>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Configuration)\</IntDir>
+    <TargetName>SLE</TargetName>
+    <IncludePath>$(ProjectDir)include;$(ProjectDir)packages\boost.1.87.0\lib\native\include;$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>false</LinkIncremental>
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Configuration)\</IntDir>
+    <TargetName>SLE</TargetName>
+    <IncludePath>$(ProjectDir)include;$(ProjectDir)packages\boost.1.87.0\lib\native\include;$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  
+  <!-- Debug Build Settings -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>WIN32;WIN64;_DEBUG;SLE_EXPORTS;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)packages\boost.1.87.0\lib\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OpenMPSupport>true</OpenMPSupport>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <!-- NFR-24: JSF C++ Compliance - Disable RTTI and Exceptions -->
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <ExceptionHandling>false</ExceptionHandling>
+      <TreatWarningAsError>false</TreatWarningAsError>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <SubSystem>Console</SubSystem>
+      <AdditionalDependencies>cudart_static.lib;cusparse.lib;cusolver.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <CudaCompile>
+      <TargetMachinePlatform>64</TargetMachinePlatform>
+      <CodeGeneration>compute_70,sm_70;compute_75,sm_75;compute_80,sm_80;compute_86,sm_86</CodeGeneration>
+      <AdditionalOptions>-Xcompiler "/openmp" --extended-lambda -std=c++17 %(AdditionalOptions)</AdditionalOptions>
+      <GenerateLineInfo>true</GenerateLineInfo>
+      <Optimization>Od</Optimization>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)packages\boost.1.87.0\lib\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </CudaCompile>
+    <PostBuildEvent>
+      <Command>xcopy /Y "$(ProjectDir)sle_engine.config" "$(OutDir)"</Command>
+      <Message>Copying sle_engine.config to output directory...</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  
+  <!-- Release Build Settings -->
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>WIN32;WIN64;NDEBUG;SLE_EXPORTS;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)packages\boost.1.87.0\lib\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OpenMPSupport>true</OpenMPSupport>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <!-- NFR-24: JSF C++ Compliance - Disable RTTI and Exceptions -->
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <ExceptionHandling>false</ExceptionHandling>
+      <TreatWarningAsError>false</TreatWarningAsError>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <SubSystem>Console</SubSystem>
+      <AdditionalDependencies>cudart_static.lib;cusparse.lib;cusolver.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <CudaCompile>
+      <TargetMachinePlatform>64</TargetMachinePlatform>
+      <CodeGeneration>compute_70,sm_70;compute_75,sm_75;compute_80,sm_80;compute_86,sm_86</CodeGeneration>
+      <AdditionalOptions>-Xcompiler "/openmp" --extended-lambda -std=c++17 %(AdditionalOptions)</AdditionalOptions>
+      <FastMath>true</FastMath>
+      <Optimization>O3</Optimization>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)packages\boost.1.87.0\lib\native\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </CudaCompile>
+    <PostBuildEvent>
+      <Command>xcopy /Y "$(ProjectDir)sle_engine.config" "$(OutDir)"</Command>
+      <Message>Copying sle_engine.config to output directory...</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  
+  <!-- CUDA Source Files -->
+  <ItemGroup>
+    <CudaCompile Include="src\kernels.cu" />
+    <CudaCompile Include="src\sparse_matrix.cu" />
+    <CudaCompile Include="src\sle_engine.cu" />
+    <CudaCompile Include="src\wls_solver.cu" />
+    <CudaCompile Include="src\network_model.cu" />
+    <CudaCompile Include="src\sle_api.cu" />
+    <CudaCompile Include="src\cholesky_optimized.cu" />
+  </ItemGroup>
+  
+  <!-- Header Files -->
+  <ItemGroup>
+    <ClInclude Include="include\sle_types.cuh" />
+    <ClInclude Include="include\sle_config.h" />
+    <ClInclude Include="include\sle_engine.h" />
+    <ClInclude Include="include\sle_api.h" />
+    <ClInclude Include="include\network_model.h" />
+    <ClInclude Include="include\sparse_matrix.cuh" />
+    <ClInclude Include="include\kernels.cuh" />
+    <ClInclude Include="include\wls_solver.cuh" />
+    <ClInclude Include="include\cuda_optimizations.cuh" />
+    <ClInclude Include="include\cholesky_optimized.cuh" />
+    <ClInclude Include="include\jsf_compliance.h" />
+    <ClInclude Include="data\ieee14bus.h" />
+  </ItemGroup>
+  
+  <!-- Configuration Files -->
+  <ItemGroup>
+    <None Include="packages.config" />
+    <None Include="sle_engine.config" />
+  </ItemGroup>
+  
+  <!-- Example Files (C++ example using C API - can be compiled separately) -->
+  <ItemGroup>
+    <None Include="examples\example_usage.cpp" />
+  </ItemGroup>
+  
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 12.6.targets" />
+    <Import Project="packages\boost.1.87.0\build\boost.targets" Condition="Exists('packages\boost.1.87.0\build\boost.targets')" />
+  </ImportGroup>
+  
+  <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
+    <PropertyGroup>
+      <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
+    </PropertyGroup>
+    <Error Condition="!Exists('packages\boost.1.87.0\build\boost.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\boost.1.87.0\build\boost.targets'))" />
+  </Target>
+</Project>
