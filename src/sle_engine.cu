@@ -1166,7 +1166,7 @@ cudaError_t DeviceDataManager::allocateMeasurementData(int32_t count) {
     size_t size_int = count * sizeof(int32_t);
     size_t size_type = count * sizeof(MeasurementType);
     size_t size_end = count * sizeof(BranchEnd);
-    size_t size_bool = count * sizeof(bool);
+    size_t size_uint8 = count * sizeof(uint8_t);  // For is_active flag
     
     cudaError_t err;
     
@@ -1194,7 +1194,7 @@ cudaError_t DeviceDataManager::allocateMeasurementData(int32_t count) {
     err = cudaMalloc(&measurements_.d_sigma, size_real);
     if (err != cudaSuccess) return err;
     
-    err = cudaMalloc(&measurements_.d_is_active, size_bool);
+    err = cudaMalloc(&measurements_.d_is_active, size_uint8);
     if (err != cudaSuccess) return err;
     
     err = cudaMalloc(&measurements_.d_estimated, size_real);
@@ -1203,7 +1203,8 @@ cudaError_t DeviceDataManager::allocateMeasurementData(int32_t count) {
     err = cudaMalloc(&measurements_.d_residual, size_real);
     if (err != cudaSuccess) return err;
     
-    total_allocated_ += 7 * size_real + size_int + size_type + size_end + size_bool;
+    // Count: pt_ratio, ct_ratio, value, weight, sigma, estimated, residual = 7 Real arrays
+    total_allocated_ += 7 * size_real + size_int + size_type + size_end + size_uint8;
     
     return cudaSuccess;
 }
@@ -1487,7 +1488,99 @@ cudaError_t DeviceDataManager::updateMeasurements(const Real* values, int32_t co
 }
 
 cudaError_t DeviceDataManager::downloadResults(NetworkModel& model) {
-    // TODO: Implement result download
+    if (!is_allocated_) {
+        return cudaErrorNotReady;
+    }
+    
+    int32_t n_buses = buses_.count;
+    int32_t n_branches = branches_.count;
+    int32_t n_measurements = measurements_.count;
+    
+    cudaError_t err;
+    
+    // Download bus voltage results
+    std::vector<Real> h_v_mag(n_buses);
+    std::vector<Real> h_v_angle(n_buses);
+    std::vector<Real> h_p_inj(n_buses);
+    std::vector<Real> h_q_inj(n_buses);
+    
+    err = cudaMemcpy(h_v_mag.data(), buses_.d_v_mag, 
+                     n_buses * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_v_angle.data(), buses_.d_v_angle,
+                     n_buses * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_p_inj.data(), buses_.d_p_injection,
+                     n_buses * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_q_inj.data(), buses_.d_q_injection,
+                     n_buses * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    // Update bus data in model
+    for (int32_t i = 0; i < n_buses; ++i) {
+        model.setBusVoltage(i, h_v_mag[i], h_v_angle[i]);
+        model.setBusPower(i, h_p_inj[i], h_q_inj[i]);
+    }
+    
+    // Download branch flow results
+    std::vector<Real> h_p_from(n_branches);
+    std::vector<Real> h_q_from(n_branches);
+    std::vector<Real> h_p_to(n_branches);
+    std::vector<Real> h_q_to(n_branches);
+    std::vector<Real> h_i_from(n_branches);
+    std::vector<Real> h_i_to(n_branches);
+    
+    err = cudaMemcpy(h_p_from.data(), branches_.d_p_flow_from,
+                     n_branches * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_q_from.data(), branches_.d_q_flow_from,
+                     n_branches * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_p_to.data(), branches_.d_p_flow_to,
+                     n_branches * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_q_to.data(), branches_.d_q_flow_to,
+                     n_branches * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_i_from.data(), branches_.d_i_mag_from,
+                     n_branches * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_i_to.data(), branches_.d_i_mag_to,
+                     n_branches * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    // Update branch data in model
+    for (int32_t i = 0; i < n_branches; ++i) {
+        model.setBranchFlows(i, h_p_from[i], h_q_from[i], h_p_to[i], h_q_to[i]);
+        model.setBranchCurrents(i, h_i_from[i], h_i_to[i]);
+    }
+    
+    // Download measurement results (estimated values and residuals)
+    std::vector<Real> h_estimated(n_measurements);
+    std::vector<Real> h_residual(n_measurements);
+    
+    err = cudaMemcpy(h_estimated.data(), measurements_.d_estimated,
+                     n_measurements * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpy(h_residual.data(), measurements_.d_residual,
+                     n_measurements * sizeof(Real), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return err;
+    
+    // Update measurement data in model
+    for (int32_t i = 0; i < n_measurements; ++i) {
+        model.setMeasurementResult(i, h_estimated[i], h_residual[i]);
+    }
+    
     return cudaSuccess;
 }
 

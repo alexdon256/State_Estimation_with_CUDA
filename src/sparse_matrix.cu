@@ -535,11 +535,12 @@ cudaError_t SparseMatrixManager::buildYbus(
     thrust::device_ptr<int32_t> d_row_ptr_ptr(ybus.d_row_ptr);
     
     // Exclusive scan: row_ptr[i] = sum of row_counts[0..i-1]
+    // Note: scan only n_buses elements from d_row_counts
     thrust::exclusive_scan(thrust::cuda::par.on(stream_),
-                          d_counts_ptr, d_counts_ptr + n_buses + 1,
+                          d_counts_ptr, d_counts_ptr + n_buses,
                           d_row_ptr_ptr);
     
-    // Compute total nnz
+    // Compute total nnz by copying counts to host and summing
     int32_t total_nnz = 0;
     std::vector<int32_t> h_row_counts(n_buses);
     cudaMemcpy(h_row_counts.data(), d_row_counts, n_buses * sizeof(int32_t),
@@ -548,7 +549,7 @@ cudaError_t SparseMatrixManager::buildYbus(
         total_nnz += h_row_counts[i];
     }
     
-    // Set last row_ptr element
+    // Set last row_ptr element (row_ptr[n_buses] = total_nnz)
     cudaMemcpy(ybus.d_row_ptr + n_buses, &total_nnz, sizeof(int32_t),
                cudaMemcpyHostToDevice);
     
@@ -908,12 +909,68 @@ __global__ void applyWeightScalingKernel(
     }
 }
 
+/**
+ * @brief Kernel to count valid (non -1) column indices per row
+ */
+__global__ void countValidEntriesKernel(
+    int32_t* __restrict__ valid_counts,
+    const int32_t* __restrict__ col_ind,
+    const int32_t* __restrict__ row_ptr,
+    int32_t n_rows)
+{
+    int32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    
+    int32_t row_start = row_ptr[row];
+    int32_t row_end = row_ptr[row + 1];
+    int32_t count = 0;
+    
+    for (int32_t idx = row_start; idx < row_end; ++idx) {
+        if (col_ind[idx] >= 0) {
+            count++;
+        }
+    }
+    
+    valid_counts[row] = count;
+}
+
+/**
+ * @brief Kernel to compact CSR matrix by removing entries with col_ind = -1
+ */
+__global__ void compactCSRKernel(
+    int32_t* __restrict__ new_col_ind,
+    Real* __restrict__ new_values,
+    const int32_t* __restrict__ new_row_ptr,
+    const int32_t* __restrict__ old_col_ind,
+    const Real* __restrict__ old_values,
+    const int32_t* __restrict__ old_row_ptr,
+    int32_t n_rows)
+{
+    int32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    
+    int32_t old_start = old_row_ptr[row];
+    int32_t old_end = old_row_ptr[row + 1];
+    int32_t new_start = new_row_ptr[row];
+    int32_t write_idx = new_start;
+    
+    for (int32_t idx = old_start; idx < old_end; ++idx) {
+        if (old_col_ind[idx] >= 0) {
+            new_col_ind[write_idx] = old_col_ind[idx];
+            new_values[write_idx] = old_values[idx];
+            write_idx++;
+        }
+    }
+}
+
 cudaError_t SparseMatrixManager::computeGainMatrix(
     const DeviceCSRMatrix& H,
     const Real* weights,
     int32_t num_weights,
     DeviceCSRMatrix& G)
 {
+    (void)num_weights;  // Suppress unused warning
+    
     if (H.nnz == 0 || H.rows == 0 || H.cols == 0) {
         return cudaErrorInvalidValue;
     }
@@ -929,44 +986,124 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     cudaDataType compute_type = CUDA_R_32F;
 #endif
     
-    // Step 1: Apply weight scaling to H -> H_w = sqrt(W) * H
-    Real* d_scaled_values;
-    cuda_err = cudaMalloc(&d_scaled_values, H.nnz * sizeof(Real));
-    if (cuda_err != cudaSuccess) return cuda_err;
-    
     dim3 block(BLOCK_SIZE_STANDARD);
     dim3 grid = compute_grid_size(H.rows, BLOCK_SIZE_STANDARD);
     
+    // Step 0: Compact the Jacobian to remove invalid entries (col_ind = -1)
+    // Count valid entries per row
+    int32_t* d_valid_counts;
+    cuda_err = cudaMalloc(&d_valid_counts, H.rows * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) return cuda_err;
+    
+    countValidEntriesKernel<<<grid, block, 0, stream_>>>(
+        d_valid_counts, H.d_col_ind, H.d_row_ptr, H.rows);
+    
+    // Compute new row pointers via exclusive scan
+    int32_t* d_compact_row_ptr;
+    cuda_err = cudaMalloc(&d_compact_row_ptr, (H.rows + 1) * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_valid_counts);
+        return cuda_err;
+    }
+    
+    thrust::device_ptr<int32_t> d_counts_ptr(d_valid_counts);
+    thrust::device_ptr<int32_t> d_row_ptr_ptr(d_compact_row_ptr);
+    thrust::exclusive_scan(thrust::cuda::par.on(stream_),
+                          d_counts_ptr, d_counts_ptr + H.rows,
+                          d_row_ptr_ptr);
+    
+    // Get total valid NNZ
+    int32_t compact_nnz = 0;
+    {
+        std::vector<int32_t> h_counts(H.rows);
+        cudaMemcpy(h_counts.data(), d_valid_counts, H.rows * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        for (int32_t i = 0; i < H.rows; ++i) compact_nnz += h_counts[i];
+    }
+    cudaMemcpy(d_compact_row_ptr + H.rows, &compact_nnz, sizeof(int32_t), cudaMemcpyHostToDevice);
+    
+    cudaFree(d_valid_counts);
+    
+    if (compact_nnz == 0) {
+        cudaFree(d_compact_row_ptr);
+        return cudaErrorInvalidValue;  // No valid entries
+    }
+    
+    // Allocate compacted arrays
+    int32_t* d_compact_col_ind;
+    Real* d_compact_values;
+    cuda_err = cudaMalloc(&d_compact_col_ind, compact_nnz * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_compact_row_ptr);
+        return cuda_err;
+    }
+    cuda_err = cudaMalloc(&d_compact_values, compact_nnz * sizeof(Real));
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_compact_row_ptr);
+        cudaFree(d_compact_col_ind);
+        return cuda_err;
+    }
+    
+    // Compact the matrix
+    compactCSRKernel<<<grid, block, 0, stream_>>>(
+        d_compact_col_ind, d_compact_values, d_compact_row_ptr,
+        H.d_col_ind, H.d_values, H.d_row_ptr, H.rows);
+    
+    // Step 1: Apply weight scaling to compacted H -> H_w = sqrt(W) * H
+    Real* d_scaled_values;
+    cuda_err = cudaMalloc(&d_scaled_values, compact_nnz * sizeof(Real));
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_compact_row_ptr);
+        cudaFree(d_compact_col_ind);
+        cudaFree(d_compact_values);
+        return cuda_err;
+    }
+    
     applyWeightScalingKernel<<<grid, block, 0, stream_>>>(
         d_scaled_values,
-        H.d_values,
+        d_compact_values,
         weights,
-        H.d_row_ptr,
+        d_compact_row_ptr,
         H.rows);
     
     cuda_err = cudaGetLastError();
     if (cuda_err != cudaSuccess) {
+        cudaFree(d_compact_row_ptr);
+        cudaFree(d_compact_col_ind);
+        cudaFree(d_compact_values);
         cudaFree(d_scaled_values);
         return cuda_err;
     }
     
-    // Step 2: Create CSC representation of H_w (which is CSR of H_w^T)
+    // Helper lambda to clean up all compacted allocations
+    auto cleanup_compact = [&]() {
+        cudaFree(d_compact_row_ptr);
+        cudaFree(d_compact_col_ind);
+        cudaFree(d_compact_values);
+    };
+    
+    // Step 2: Create CSC representation of compacted H_w (which is CSR of H_w^T)
     // Using cusparseCsr2cscEx2 for efficient transpose
     int32_t* d_HT_row_ptr;  // This will be H^T's row_ptr (H's col_ptr in CSC)
     int32_t* d_HT_col_ind;  // This will be H^T's col_ind (H's row indices)
     Real* d_HT_values;
     
     cuda_err = cudaMalloc(&d_HT_row_ptr, (H.cols + 1) * sizeof(int32_t));
-    if (cuda_err != cudaSuccess) { cudaFree(d_scaled_values); return cuda_err; }
-    
-    cuda_err = cudaMalloc(&d_HT_col_ind, H.nnz * sizeof(int32_t));
     if (cuda_err != cudaSuccess) { 
+        cleanup_compact(); 
+        cudaFree(d_scaled_values); 
+        return cuda_err; 
+    }
+    
+    cuda_err = cudaMalloc(&d_HT_col_ind, compact_nnz * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) { 
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         return cuda_err; 
     }
     
-    cuda_err = cudaMalloc(&d_HT_values, H.nnz * sizeof(Real));
+    cuda_err = cudaMalloc(&d_HT_values, compact_nnz * sizeof(Real));
     if (cuda_err != cudaSuccess) { 
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); cudaFree(d_HT_col_ind);
         return cuda_err; 
     }
@@ -975,14 +1112,15 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     size_t buffer_size;
     sparse_err = cusparseCsr2cscEx2_bufferSize(
         cusparse_handle_,
-        H.rows, H.cols, H.nnz,
-        d_scaled_values, H.d_row_ptr, H.d_col_ind,
+        H.rows, H.cols, compact_nnz,
+        d_scaled_values, d_compact_row_ptr, d_compact_col_ind,
         d_HT_values, d_HT_row_ptr, d_HT_col_ind,
         data_type, CUSPARSE_ACTION_NUMERIC,
         CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG1,
         &buffer_size);
     
     if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -990,6 +1128,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     
     cuda_err = ensureSpGEMMBuffer(buffer_size);
     if (cuda_err != cudaSuccess) {
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cuda_err;
@@ -998,14 +1137,15 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     // Execute transpose (CSR to CSC, which gives us H^T in CSR form)
     sparse_err = cusparseCsr2cscEx2(
         cusparse_handle_,
-        H.rows, H.cols, H.nnz,
-        d_scaled_values, H.d_row_ptr, H.d_col_ind,
+        H.rows, H.cols, compact_nnz,
+        d_scaled_values, d_compact_row_ptr, d_compact_col_ind,
         d_HT_values, d_HT_row_ptr, d_HT_col_ind,
         data_type, CUSPARSE_ACTION_NUMERIC,
         CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG1,
         spgemm_buffer_);
     
     if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1015,23 +1155,25 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     cusparseSpMatDescr_t matHT, matHw, matG;
     
     // Create H^T matrix descriptor (cols x rows)
-    sparse_err = cusparseCreateCsr(&matHT, H.cols, H.rows, H.nnz,
+    sparse_err = cusparseCreateCsr(&matHT, H.cols, H.rows, compact_nnz,
                                    d_HT_row_ptr, d_HT_col_ind, d_HT_values,
                                    CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
                                    CUSPARSE_INDEX_BASE_ZERO, data_type);
     if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
     }
     
-    // Create H_w matrix descriptor (rows x cols)
-    sparse_err = cusparseCreateCsr(&matHw, H.rows, H.cols, H.nnz,
-                                   H.d_row_ptr, H.d_col_ind, d_scaled_values,
+    // Create H_w matrix descriptor (rows x cols) using compacted arrays
+    sparse_err = cusparseCreateCsr(&matHw, H.rows, H.cols, compact_nnz,
+                                   d_compact_row_ptr, d_compact_col_ind, d_scaled_values,
                                    CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
                                    CUSPARSE_INDEX_BASE_ZERO, data_type);
     if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
         cusparseDestroySpMat(matHT);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1045,6 +1187,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1057,6 +1200,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1078,6 +1222,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1090,6 +1235,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cuda_err;
@@ -1107,6 +1253,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1125,6 +1272,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1138,6 +1286,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cuda_err;
@@ -1156,6 +1305,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cudaErrorUnknown;
@@ -1176,6 +1326,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
         cusparseDestroySpMat(matHT);
         cusparseDestroySpMat(matHw);
         cusparseDestroySpMat(matG);
+        cleanup_compact();
         cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
         cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
         return cuda_err;
@@ -1202,6 +1353,7 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
     cudaFree(d_HT_row_ptr);
     cudaFree(d_HT_col_ind);
     cudaFree(d_HT_values);
+    cleanup_compact();  // Free compacted arrays
     
     if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
         return cudaErrorUnknown;
@@ -1215,15 +1367,181 @@ cudaError_t SparseMatrixManager::computeGainMatrix(
 // Jacobian Pattern Analysis
 //=============================================================================
 
+/**
+ * @brief Kernel to compute Jacobian row counts based on measurement types
+ */
+__global__ void countJacobianNNZKernel(
+    int32_t* __restrict__ row_counts,
+    const MeasurementType* __restrict__ meas_type,
+    const int32_t* __restrict__ location_index,
+    const uint8_t* __restrict__ is_active,
+    const int32_t* __restrict__ ybus_row_ptr,
+    int32_t n_meas,
+    int32_t n_buses,
+    int32_t slack_index)
+{
+    int32_t m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= n_meas) return;
+    
+    if (!is_active[m]) {
+        row_counts[m] = 0;
+        return;
+    }
+    
+    MeasurementType type = meas_type[m];
+    int32_t loc = location_index[m];
+    int32_t count = 0;
+    
+    switch (type) {
+        case MeasurementType::V_MAG:
+            // dV/dVi = 1 entry
+            count = 1;
+            break;
+            
+        case MeasurementType::V_ANGLE:
+            // dθ/dθi = 1 entry (unless slack bus)
+            count = (loc != slack_index) ? 1 : 0;
+            break;
+            
+        case MeasurementType::P_INJECTION:
+        case MeasurementType::Q_INJECTION:
+        case MeasurementType::P_PSEUDO:
+        case MeasurementType::Q_PSEUDO: {
+            // For injection measurements, depends on Ybus connectivity
+            // Each connected bus j contributes dP/dθj and dP/dVj
+            // Plus self entries dP/dθi and dP/dVi
+            int32_t ybus_start = ybus_row_ptr[loc];
+            int32_t ybus_end = ybus_row_ptr[loc + 1];
+            int32_t n_neighbors = ybus_end - ybus_start;  // includes self
+            
+            // For each neighbor: angle + magnitude (2 per neighbor)
+            // Minus 1 angle if it's the slack bus
+            count = 2 * n_neighbors;
+            if (loc == slack_index) count--;  // No dP/dθi for slack
+            // Check if any neighbors are slack and subtract their angle derivatives
+            // For simplicity, we overestimate - the actual fill will handle zeros
+            break;
+        }
+            
+        case MeasurementType::P_FLOW:
+        case MeasurementType::Q_FLOW:
+        case MeasurementType::I_MAG:
+            // Branch measurements depend on from/to buses: 4 entries max
+            // (Vi, Vj, θi, θj) minus slack angle if applicable
+            count = 4;
+            break;
+            
+        default:
+            count = 0;
+            break;
+    }
+    
+    row_counts[m] = count;
+}
+
+/**
+ * @brief Kernel to fill Jacobian column indices based on measurement types
+ */
+__global__ void fillJacobianPatternKernel(
+    int32_t* __restrict__ col_ind,
+    const int32_t* __restrict__ row_ptr,
+    const MeasurementType* __restrict__ meas_type,
+    const int32_t* __restrict__ location_index,
+    const BranchEnd* __restrict__ branch_end,
+    const uint8_t* __restrict__ is_active,
+    const int32_t* __restrict__ ybus_row_ptr,
+    const int32_t* __restrict__ ybus_col_ind,
+    const int32_t* __restrict__ from_bus,
+    const int32_t* __restrict__ to_bus,
+    int32_t n_meas,
+    int32_t n_buses,
+    int32_t slack_index)
+{
+    int32_t m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= n_meas || !is_active[m]) return;
+    
+    MeasurementType type = meas_type[m];
+    int32_t loc = location_index[m];
+    int32_t h_idx = row_ptr[m];
+    
+    // Helper function to convert bus index to angle state index
+    auto angle_state_idx = [slack_index, n_buses](int32_t bus) -> int32_t {
+        if (bus == slack_index) return -1;
+        return (bus < slack_index) ? bus : bus - 1;
+    };
+    
+    // Helper to convert bus index to voltage magnitude state index
+    auto vmag_state_idx = [n_buses](int32_t bus) -> int32_t {
+        return n_buses - 1 + bus;
+    };
+    
+    switch (type) {
+        case MeasurementType::V_MAG:
+            col_ind[h_idx] = vmag_state_idx(loc);
+            break;
+            
+        case MeasurementType::V_ANGLE: {
+            int32_t angle_idx = angle_state_idx(loc);
+            if (angle_idx >= 0) {
+                col_ind[h_idx] = angle_idx;
+            }
+            break;
+        }
+            
+        case MeasurementType::P_INJECTION:
+        case MeasurementType::Q_INJECTION:
+        case MeasurementType::P_PSEUDO:
+        case MeasurementType::Q_PSEUDO: {
+            int32_t ybus_start = ybus_row_ptr[loc];
+            int32_t ybus_end = ybus_row_ptr[loc + 1];
+            int32_t idx = h_idx;
+            
+            for (int32_t k = ybus_start; k < ybus_end; ++k) {
+                int32_t j = ybus_col_ind[k];
+                
+                // Add angle derivative (skip slack)
+                int32_t angle_idx = angle_state_idx(j);
+                if (angle_idx >= 0) {
+                    col_ind[idx++] = angle_idx;
+                }
+                
+                // Add voltage magnitude derivative
+                col_ind[idx++] = vmag_state_idx(j);
+            }
+            break;
+        }
+            
+        case MeasurementType::P_FLOW:
+        case MeasurementType::Q_FLOW:
+        case MeasurementType::I_MAG: {
+            int32_t br = loc;
+            int32_t i = from_bus[br];
+            int32_t j = to_bus[br];
+            int32_t idx = h_idx;
+            
+            // From bus angle and magnitude
+            int32_t angle_i = angle_state_idx(i);
+            if (angle_i >= 0) col_ind[idx++] = angle_i;
+            col_ind[idx++] = vmag_state_idx(i);
+            
+            // To bus angle and magnitude
+            int32_t angle_j = angle_state_idx(j);
+            if (angle_j >= 0) col_ind[idx++] = angle_j;
+            col_ind[idx++] = vmag_state_idx(j);
+            break;
+        }
+            
+        default:
+            break;
+    }
+}
+
 cudaError_t SparseMatrixManager::analyzeJacobianPattern(
     const DeviceMeasurementData& measurements,
     const DeviceBusData& buses,
     const DeviceBranchData& branches,
     DeviceCSRMatrix& H)
 {
-    // Suppress unused parameter warning - branches will be used for full pattern analysis
-    (void)branches;
-    
     // Jacobian dimensions:
     // Rows = number of measurements
     // Cols = number of state variables = 2*n_buses - 1 (angles except slack + all magnitudes)
@@ -1232,40 +1550,77 @@ cudaError_t SparseMatrixManager::analyzeJacobianPattern(
     int32_t n_buses = buses.count;
     int32_t n_states = 2 * n_buses - 1;
     
-    // Estimate NNZ based on measurement types
-    // V_mag: 1 nnz per measurement
-    // P/Q injection: up to 2*(avg_degree) nnz per measurement
-    // P/Q flow: 4 nnz per measurement (2 buses, angle and mag each)
+    // Need Ybus to be valid for pattern analysis
+    // (Ybus pattern determines injection measurement pattern)
     
-    int32_t estimated_nnz = n_meas * 10;  // Conservative estimate
+    dim3 block(BLOCK_SIZE_STANDARD);
+    dim3 grid = compute_grid_size(n_meas, BLOCK_SIZE_STANDARD);
     
-    // Allocate Jacobian matrix
+    // For pattern analysis, we need a valid Ybus or use estimated pattern
+    // If Ybus is not available, use worst-case estimate
+    constexpr int32_t avg_degree = 4;  // Typical power system connectivity
+    
+    // Simple estimation: each bus connected to ~4 others on average
+    // V_mag: 1, V_angle: 1, P/Q_inj: 2*(avg_degree), P/Q_flow: 4
+    int32_t entries_per_meas = 2 * avg_degree + 2;
+    int32_t estimated_nnz = n_meas * entries_per_meas;
+    
+    // Allocate Jacobian matrix with estimated size
     cudaError_t err = allocateCSR(H, n_meas, n_states, estimated_nnz);
-    if (err != cudaSuccess) return err;
+    if (err != cudaSuccess) {
+        return err;
+    }
     
-    // Pattern analysis would go here
-    // For now, initialize with estimated pattern
+    // Initialize row_ptr with simple pattern:
+    // Each measurement gets up to (2 * avg_degree + 2) entries
+    std::vector<int32_t> h_row_ptr(n_meas + 1);
+    int32_t nnz_offset = 0;
+    for (int32_t m = 0; m < n_meas; ++m) {
+        h_row_ptr[m] = nnz_offset;
+        nnz_offset += entries_per_meas;  // Max entries per measurement
+    }
+    h_row_ptr[n_meas] = nnz_offset;
+    
+    err = cudaMemcpy(H.d_row_ptr, h_row_ptr.data(), (n_meas + 1) * sizeof(int32_t),
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    
+    // Initialize column indices to -1 (invalid)
+    cudaMemsetAsync(H.d_col_ind, -1, estimated_nnz * sizeof(int32_t), stream_);
+    
+    // Initialize values to zero
+    cudaMemsetAsync(H.d_values, 0, estimated_nnz * sizeof(Real), stream_);
+    
+    // The actual column indices will be filled dynamically during Jacobian computation
+    // based on measurement types and network connectivity
+    
+    // Store branches pointer for later use (suppress unused warning)
+    (void)branches;
     
     return cudaSuccess;
 }
 
 /**
- * @brief Kernel to compute Jacobian values for all measurement types
+ * @brief Kernel to compute Jacobian values AND fill column indices for all measurement types
  * 
  * State variable layout:
  * - States 0 to n_buses-2: voltage angles (skip slack bus)
  * - States n_buses-1 to 2*n_buses-2: voltage magnitudes
+ * 
+ * This kernel fills both H_col_ind and H_values in a single pass for efficiency.
  */
 __global__ void computeJacobianValuesKernel(
     Real* __restrict__ H_values,
+    int32_t* __restrict__ H_col_ind,
     const int32_t* __restrict__ H_row_ptr,
-    const int32_t* __restrict__ H_col_ind,
     const MeasurementType* __restrict__ meas_type,
     const int32_t* __restrict__ location_index,
     const BranchEnd* __restrict__ branch_end,
     const Real* __restrict__ pt_ratio,
     const Real* __restrict__ ct_ratio,
-    const bool* __restrict__ is_active,
+    const uint8_t* __restrict__ is_active,
     const Real* __restrict__ v_mag,
     const Real* __restrict__ v_angle,
     const int32_t* __restrict__ ybus_row_ptr,
@@ -1283,17 +1638,27 @@ __global__ void computeJacobianValuesKernel(
     int32_t n_meas)
 {
     int32_t m = blockIdx.x * blockDim.x + threadIdx.x;
-    if (m >= n_meas || !is_active[m]) return;
+    if (m >= n_meas) return;
+    
+    int32_t row_start = H_row_ptr[m];
+    int32_t row_end = H_row_ptr[m + 1];
+    
+    // Clear this row first (set invalid column indices)
+    for (int32_t hi = row_start; hi < row_end; ++hi) {
+        H_col_ind[hi] = -1;
+        H_values[hi] = 0.0f;
+    }
+    
+    if (!is_active[m]) return;
     
     MeasurementType type = meas_type[m];
     int32_t loc = location_index[m];
     Real pt = pt_ratio[m];
     Real ct = ct_ratio[m];
-    int32_t row_start = H_row_ptr[m];
     
     // Helper lambda to convert bus index to angle state index
     // Returns -1 if bus is slack (no angle state)
-    auto angle_state_idx = [slack_index, n_buses](int32_t bus) -> int32_t {
+    auto angle_state_idx = [slack_index](int32_t bus) -> int32_t {
         if (bus == slack_index) return -1;
         return (bus < slack_index) ? bus : bus - 1;
     };
@@ -1303,41 +1668,40 @@ __global__ void computeJacobianValuesKernel(
         return n_buses - 1 + bus;
     };
     
+    int32_t h_idx = row_start;  // Current write position
+    
     switch (type) {
         case MeasurementType::V_MAG: {
             // dh/dV_i = 1/pt_ratio
-            // The Jacobian has only one non-zero at the voltage magnitude state
             int32_t state_idx = vmag_state_idx(loc);
-            if (H_col_ind[row_start] == state_idx) {
-                H_values[row_start] = 1.0f / pt;
-            }
+            H_col_ind[h_idx] = state_idx;
+            H_values[h_idx] = 1.0f / pt;
             break;
         }
         
         case MeasurementType::V_ANGLE: {
             // dh/dtheta_i = 1
             int32_t state_idx = angle_state_idx(loc);
-            if (state_idx >= 0 && H_col_ind[row_start] == state_idx) {
-                H_values[row_start] = 1.0f;
+            if (state_idx >= 0) {
+                H_col_ind[h_idx] = state_idx;
+                H_values[h_idx] = 1.0f;
             }
             break;
         }
         
         case MeasurementType::P_INJECTION: {
-            // dP_i/dtheta_j = V_i * V_j * (G_ij * sin(theta_ij) - B_ij * cos(theta_ij))
-            // dP_i/dV_j = V_i * (G_ij * cos(theta_ij) + B_ij * sin(theta_ij))
-            // dP_i/dV_i = 2*V_i*G_ii + sum_j(V_j*(G_ij*cos(theta_ij) + B_ij*sin(theta_ij)))
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
             Real scale = 1.0f / (pt * ct);
             
             int32_t ybus_start = ybus_row_ptr[loc];
             int32_t ybus_end = ybus_row_ptr[loc + 1];
-            int32_t h_idx = row_start;
             
-            // Diagonal term for V_i magnitude
+            // Compute diagonal terms first
             Real dP_dVi = 0.0f;
+            Real dP_dtheta_i = 0.0f;
             
+            // Compute all derivatives
             for (int32_t k = ybus_start; k < ybus_end; ++k) {
                 int32_t j = ybus_col_ind[k];
                 Real Gij = ybus_g[k];
@@ -1349,64 +1713,50 @@ __global__ void computeJacobianValuesKernel(
                 Real sin_t = sinf(theta_ij);
                 
                 if (j == loc) {
-                    // Diagonal: dP_i/dV_i
+                    // Diagonal self-admittance contribution
                     dP_dVi += 2.0f * Vi * Gij;
                 } else {
+                    // Off-diagonal terms
+                    dP_dVi += Vj * (Gij * cos_t + Bij * sin_t);
+                    dP_dtheta_i += Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                    
                     // Off-diagonal angle derivative: dP_i/dtheta_j
                     int32_t angle_idx = angle_state_idx(j);
-                    if (angle_idx >= 0) {
+                    if (angle_idx >= 0 && h_idx < row_end) {
                         Real dP_dtheta_j = -Vi * Vj * (Gij * sin_t - Bij * cos_t);
-                        // Find position in H_col_ind and write
-                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                            if (H_col_ind[hi] == angle_idx) {
-                                H_values[hi] = dP_dtheta_j * scale;
-                                break;
-                            }
-                        }
+                        H_col_ind[h_idx] = angle_idx;
+                        H_values[h_idx] = dP_dtheta_j * scale;
+                        h_idx++;
                     }
                     
                     // Off-diagonal voltage derivative: dP_i/dV_j
-                    int32_t vmag_idx = vmag_state_idx(j);
-                    Real dP_dVj = Vi * (Gij * cos_t + Bij * sin_t);
-                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                        if (H_col_ind[hi] == vmag_idx) {
-                            H_values[hi] = dP_dVj * scale;
-                            break;
-                        }
-                    }
-                    
-                    // Accumulate for diagonal V term
-                    dP_dVi += Vj * (Gij * cos_t + Bij * sin_t);
-                }
-                
-                // Diagonal angle derivative: dP_i/dtheta_i
-                if (j != loc) {
-                    int32_t angle_idx_i = angle_state_idx(loc);
-                    if (angle_idx_i >= 0) {
-                        Real dP_dtheta_i = Vi * Vj * (Gij * sin_t - Bij * cos_t);
-                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                            if (H_col_ind[hi] == angle_idx_i) {
-                                H_values[hi] += dP_dtheta_i * scale;
-                                break;
-                            }
-                        }
+                    if (h_idx < row_end) {
+                        int32_t vmag_idx = vmag_state_idx(j);
+                        Real dP_dVj = Vi * (Gij * cos_t + Bij * sin_t);
+                        H_col_ind[h_idx] = vmag_idx;
+                        H_values[h_idx] = dP_dVj * scale;
+                        h_idx++;
                     }
                 }
             }
             
-            // Write diagonal V magnitude derivative
-            int32_t vmag_idx_i = vmag_state_idx(loc);
-            for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                if (H_col_ind[hi] == vmag_idx_i) {
-                    H_values[hi] = dP_dVi * scale;
-                    break;
-                }
+            // Write diagonal terms
+            int32_t angle_idx_i = angle_state_idx(loc);
+            if (angle_idx_i >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_i;
+                H_values[h_idx] = dP_dtheta_i * scale;
+                h_idx++;
+            }
+            
+            if (h_idx < row_end) {
+                int32_t vmag_idx_i = vmag_state_idx(loc);
+                H_col_ind[h_idx] = vmag_idx_i;
+                H_values[h_idx] = dP_dVi * scale;
             }
             break;
         }
         
         case MeasurementType::Q_INJECTION: {
-            // Similar to P_INJECTION but with Q equations
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
             Real scale = 1.0f / (pt * ct);
@@ -1415,6 +1765,7 @@ __global__ void computeJacobianValuesKernel(
             int32_t ybus_end = ybus_row_ptr[loc + 1];
             
             Real dQ_dVi = 0.0f;
+            Real dQ_dtheta_i = 0.0f;
             
             for (int32_t k = ybus_start; k < ybus_end; ++k) {
                 int32_t j = ybus_col_ind[k];
@@ -1429,66 +1780,57 @@ __global__ void computeJacobianValuesKernel(
                 if (j == loc) {
                     dQ_dVi += -2.0f * Vi * Bij;
                 } else {
+                    dQ_dVi += Vj * (Gij * sin_t - Bij * cos_t);
+                    dQ_dtheta_i += Vi * Vj * (Gij * cos_t + Bij * sin_t);
+                    
                     // dQ_i/dtheta_j
                     int32_t angle_idx = angle_state_idx(j);
-                    if (angle_idx >= 0) {
+                    if (angle_idx >= 0 && h_idx < row_end) {
                         Real dQ_dtheta_j = -Vi * Vj * (Gij * cos_t + Bij * sin_t);
-                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                            if (H_col_ind[hi] == angle_idx) {
-                                H_values[hi] = dQ_dtheta_j * scale;
-                                break;
-                            }
-                        }
+                        H_col_ind[h_idx] = angle_idx;
+                        H_values[h_idx] = dQ_dtheta_j * scale;
+                        h_idx++;
                     }
                     
                     // dQ_i/dV_j
-                    int32_t vmag_idx = vmag_state_idx(j);
-                    Real dQ_dVj = Vi * (Gij * sin_t - Bij * cos_t);
-                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                        if (H_col_ind[hi] == vmag_idx) {
-                            H_values[hi] = dQ_dVj * scale;
-                            break;
-                        }
-                    }
-                    
-                    dQ_dVi += Vj * (Gij * sin_t - Bij * cos_t);
-                    
-                    // dQ_i/dtheta_i
-                    int32_t angle_idx_i = angle_state_idx(loc);
-                    if (angle_idx_i >= 0) {
-                        Real dQ_dtheta_i = Vi * Vj * (Gij * cos_t + Bij * sin_t);
-                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                            if (H_col_ind[hi] == angle_idx_i) {
-                                H_values[hi] += dQ_dtheta_i * scale;
-                                break;
-                            }
-                        }
+                    if (h_idx < row_end) {
+                        int32_t vmag_idx = vmag_state_idx(j);
+                        Real dQ_dVj = Vi * (Gij * sin_t - Bij * cos_t);
+                        H_col_ind[h_idx] = vmag_idx;
+                        H_values[h_idx] = dQ_dVj * scale;
+                        h_idx++;
                     }
                 }
             }
             
-            int32_t vmag_idx_i = vmag_state_idx(loc);
-            for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                if (H_col_ind[hi] == vmag_idx_i) {
-                    H_values[hi] = dQ_dVi * scale;
-                    break;
-                }
+            // Write diagonal terms
+            int32_t angle_idx_i = angle_state_idx(loc);
+            if (angle_idx_i >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_i;
+                H_values[h_idx] = dQ_dtheta_i * scale;
+                h_idx++;
+            }
+            
+            if (h_idx < row_end) {
+                int32_t vmag_idx_i = vmag_state_idx(loc);
+                H_col_ind[h_idx] = vmag_idx_i;
+                H_values[h_idx] = dQ_dVi * scale;
             }
             break;
         }
         
         case MeasurementType::P_FLOW:
         case MeasurementType::Q_FLOW: {
-            // Branch flow derivatives - simpler: only depends on from/to buses
+            // Branch flow derivatives - depends on from/to buses only
             int32_t br = loc;  // branch index
-            int32_t i = from_bus[br];
-            int32_t j = to_bus[br];
+            int32_t i_bus = from_bus[br];
+            int32_t j_bus = to_bus[br];
             BranchEnd end = branch_end[m];
             
-            Real Vi = v_mag[i];
-            Real Vj = v_mag[j];
-            Real theta_i = v_angle[i];
-            Real theta_j = v_angle[j];
+            Real Vi = v_mag[i_bus];
+            Real Vj = v_mag[j_bus];
+            Real theta_i = v_angle[i_bus];
+            Real theta_j = v_angle[j_bus];
             Real g = g_series[br];
             Real b = b_series[br];
             Real a = tap_ratio[br];
@@ -1501,56 +1843,254 @@ __global__ void computeJacobianValuesKernel(
             Real a2 = a * a;
             Real inv_a = 1.0f / a;
             
+            Real dF_dtheta_i, dF_dtheta_j, dF_dVi, dF_dVj;
+            
             if (type == MeasurementType::P_FLOW) {
                 if (end == BranchEnd::FROM) {
-                    // P_ij at from side
-                    Real dP_dVi = (2.0f * Vi / a2) * g - (Vj * inv_a) * (g * cos_t + b * sin_t);
-                    Real dP_dVj = -(Vi * inv_a) * (g * cos_t + b * sin_t);
-                    Real dP_dtheta_i = (Vi * Vj * inv_a) * (g * sin_t - b * cos_t);
-                    Real dP_dtheta_j = -(Vi * Vj * inv_a) * (g * sin_t - b * cos_t);
-                    
-                    // Write to Jacobian
-                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                        int32_t col = H_col_ind[hi];
-                        if (col == vmag_state_idx(i)) H_values[hi] = dP_dVi * scale;
-                        else if (col == vmag_state_idx(j)) H_values[hi] = dP_dVj * scale;
-                        else if (col == angle_state_idx(i) && angle_state_idx(i) >= 0) 
-                            H_values[hi] = dP_dtheta_i * scale;
-                        else if (col == angle_state_idx(j) && angle_state_idx(j) >= 0) 
-                            H_values[hi] = dP_dtheta_j * scale;
-                    }
+                    dF_dVi = (2.0f * Vi / a2) * g - (Vj * inv_a) * (g * cos_t + b * sin_t);
+                    dF_dVj = -(Vi * inv_a) * (g * cos_t + b * sin_t);
+                    dF_dtheta_i = (Vi * Vj * inv_a) * (g * sin_t - b * cos_t);
+                    dF_dtheta_j = -(Vi * Vj * inv_a) * (g * sin_t - b * cos_t);
                 } else {
-                    // P_ji at to side
-                    Real dP_dVi = -(Vj * inv_a) * (g * cos_t - b * sin_t);
-                    Real dP_dVj = 2.0f * Vj * g - (Vi * inv_a) * (g * cos_t - b * sin_t);
-                    Real dP_dtheta_i = (Vi * Vj * inv_a) * (-g * sin_t - b * cos_t);
-                    Real dP_dtheta_j = -(Vi * Vj * inv_a) * (-g * sin_t - b * cos_t);
-                    
-                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                        int32_t col = H_col_ind[hi];
-                        if (col == vmag_state_idx(i)) H_values[hi] = dP_dVi * scale;
-                        else if (col == vmag_state_idx(j)) H_values[hi] = dP_dVj * scale;
-                        else if (col == angle_state_idx(i) && angle_state_idx(i) >= 0) 
-                            H_values[hi] = dP_dtheta_i * scale;
-                        else if (col == angle_state_idx(j) && angle_state_idx(j) >= 0) 
-                            H_values[hi] = dP_dtheta_j * scale;
-                    }
+                    dF_dVi = -(Vj * inv_a) * (g * cos_t - b * sin_t);
+                    dF_dVj = 2.0f * Vj * g - (Vi * inv_a) * (g * cos_t - b * sin_t);
+                    dF_dtheta_i = (Vi * Vj * inv_a) * (-g * sin_t - b * cos_t);
+                    dF_dtheta_j = -(Vi * Vj * inv_a) * (-g * sin_t - b * cos_t);
                 }
             } else {  // Q_FLOW
-                // Similar structure with Q derivatives
-                // Simplified for now - full derivation needed
-                for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
-                    H_values[hi] = 0.0f;  // Placeholder - needs proper Q flow derivatives
+                if (end == BranchEnd::FROM) {
+                    dF_dVi = -2.0f * Vi * b / a2 - (Vj * inv_a) * (g * sin_t - b * cos_t);
+                    dF_dVj = -(Vi * inv_a) * (g * sin_t - b * cos_t);
+                    dF_dtheta_i = -(Vi * Vj * inv_a) * (g * cos_t + b * sin_t);
+                    dF_dtheta_j = (Vi * Vj * inv_a) * (g * cos_t + b * sin_t);
+                } else {
+                    dF_dVi = (Vj * inv_a) * (g * sin_t + b * cos_t);
+                    dF_dVj = -2.0f * Vj * b + (Vi * inv_a) * (g * sin_t + b * cos_t);
+                    dF_dtheta_i = (Vi * Vj * inv_a) * (g * cos_t - b * sin_t);
+                    dF_dtheta_j = -(Vi * Vj * inv_a) * (g * cos_t - b * sin_t);
                 }
+            }
+            
+            // Write directly to Jacobian (from bus entries)
+            int32_t angle_idx_i = angle_state_idx(i_bus);
+            if (angle_idx_i >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_i;
+                H_values[h_idx] = dF_dtheta_i * scale;
+                h_idx++;
+            }
+            if (h_idx < row_end) {
+                H_col_ind[h_idx] = vmag_state_idx(i_bus);
+                H_values[h_idx] = dF_dVi * scale;
+                h_idx++;
+            }
+            
+            // Write directly to Jacobian (to bus entries)
+            int32_t angle_idx_j = angle_state_idx(j_bus);
+            if (angle_idx_j >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_j;
+                H_values[h_idx] = dF_dtheta_j * scale;
+                h_idx++;
+            }
+            if (h_idx < row_end) {
+                H_col_ind[h_idx] = vmag_state_idx(j_bus);
+                H_values[h_idx] = dF_dVj * scale;
             }
             break;
         }
         
-        case MeasurementType::P_PSEUDO:
-        case MeasurementType::Q_PSEUDO:
-            // Same as injection but with pseudo (zero) value
-            // Reuse injection logic
+        case MeasurementType::P_PSEUDO: {
+            // Zero injection P: same Jacobian structure as P_INJECTION, no scale
+            Real Vi = v_mag[loc];
+            Real theta_i = v_angle[loc];
+            
+            int32_t ybus_start = ybus_row_ptr[loc];
+            int32_t ybus_end_idx = ybus_row_ptr[loc + 1];
+            
+            Real dP_dVi = 0.0f;
+            Real dP_dtheta_i = 0.0f;
+            
+            for (int32_t k = ybus_start; k < ybus_end_idx; ++k) {
+                int32_t j_bus = ybus_col_ind[k];
+                Real Gij = ybus_g[k];
+                Real Bij = ybus_b[k];
+                Real Vj = v_mag[j_bus];
+                Real theta_j = v_angle[j_bus];
+                Real theta_ij = theta_i - theta_j;
+                Real cos_t = cosf(theta_ij);
+                Real sin_t = sinf(theta_ij);
+                
+                if (j_bus == loc) {
+                    dP_dVi += 2.0f * Vi * Gij;
+                } else {
+                    dP_dVi += Vj * (Gij * cos_t + Bij * sin_t);
+                    dP_dtheta_i += Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                    
+                    int32_t angle_idx = angle_state_idx(j_bus);
+                    if (angle_idx >= 0 && h_idx < row_end) {
+                        Real dP_dtheta_j = -Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                        H_col_ind[h_idx] = angle_idx;
+                        H_values[h_idx] = dP_dtheta_j;
+                        h_idx++;
+                    }
+                    
+                    if (h_idx < row_end) {
+                        int32_t vmag_idx = vmag_state_idx(j_bus);
+                        Real dP_dVj = Vi * (Gij * cos_t + Bij * sin_t);
+                        H_col_ind[h_idx] = vmag_idx;
+                        H_values[h_idx] = dP_dVj;
+                        h_idx++;
+                    }
+                }
+            }
+            
+            int32_t angle_idx_i = angle_state_idx(loc);
+            if (angle_idx_i >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_i;
+                H_values[h_idx] = dP_dtheta_i;
+                h_idx++;
+            }
+            
+            if (h_idx < row_end) {
+                int32_t vmag_idx_i = vmag_state_idx(loc);
+                H_col_ind[h_idx] = vmag_idx_i;
+                H_values[h_idx] = dP_dVi;
+            }
             break;
+        }
+        
+        case MeasurementType::Q_PSEUDO: {
+            // Zero injection Q: same Jacobian structure as Q_INJECTION, no scale
+            Real Vi = v_mag[loc];
+            Real theta_i = v_angle[loc];
+            
+            int32_t ybus_start = ybus_row_ptr[loc];
+            int32_t ybus_end_idx = ybus_row_ptr[loc + 1];
+            
+            Real dQ_dVi = 0.0f;
+            Real dQ_dtheta_i = 0.0f;
+            
+            for (int32_t k = ybus_start; k < ybus_end_idx; ++k) {
+                int32_t j_bus = ybus_col_ind[k];
+                Real Gij = ybus_g[k];
+                Real Bij = ybus_b[k];
+                Real Vj = v_mag[j_bus];
+                Real theta_j = v_angle[j_bus];
+                Real theta_ij = theta_i - theta_j;
+                Real cos_t = cosf(theta_ij);
+                Real sin_t = sinf(theta_ij);
+                
+                if (j_bus == loc) {
+                    dQ_dVi += -2.0f * Vi * Bij;
+                } else {
+                    dQ_dVi += Vj * (Gij * sin_t - Bij * cos_t);
+                    dQ_dtheta_i += Vi * Vj * (Gij * cos_t + Bij * sin_t);
+                    
+                    int32_t angle_idx = angle_state_idx(j_bus);
+                    if (angle_idx >= 0 && h_idx < row_end) {
+                        Real dQ_dtheta_j = -Vi * Vj * (Gij * cos_t + Bij * sin_t);
+                        H_col_ind[h_idx] = angle_idx;
+                        H_values[h_idx] = dQ_dtheta_j;
+                        h_idx++;
+                    }
+                    
+                    if (h_idx < row_end) {
+                        int32_t vmag_idx = vmag_state_idx(j_bus);
+                        Real dQ_dVj = Vi * (Gij * sin_t - Bij * cos_t);
+                        H_col_ind[h_idx] = vmag_idx;
+                        H_values[h_idx] = dQ_dVj;
+                        h_idx++;
+                    }
+                }
+            }
+            
+            // Write diagonal terms
+            int32_t angle_idx_i = angle_state_idx(loc);
+            if (angle_idx_i >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_i;
+                H_values[h_idx] = dQ_dtheta_i;
+                h_idx++;
+            }
+            
+            if (h_idx < row_end) {
+                int32_t vmag_idx_i = vmag_state_idx(loc);
+                H_col_ind[h_idx] = vmag_idx_i;
+                H_values[h_idx] = dQ_dVi;
+            }
+            break;
+        }
+        
+        case MeasurementType::I_MAG: {
+            // Current magnitude: |I| = sqrt(P^2 + Q^2) / V
+            // d|I|/dx = (P*dP/dx + Q*dQ/dx) / (|I|*V) - |I|/V * dV/dx * V / V^2
+            // For now, use same structure as P_FLOW/Q_FLOW
+            // This is an approximation that works well near flat start
+            
+            int32_t br = loc;
+            int32_t i_bus = from_bus[br];
+            int32_t j_bus = to_bus[br];
+            BranchEnd end = branch_end[m];
+            
+            // For I_MAG, derivatives have similar structure to P/Q flow
+            // but scale differently. Use P_FLOW pattern as approximation.
+            Real Vi = v_mag[i_bus];
+            Real Vj = v_mag[j_bus];
+            Real theta_i = v_angle[i_bus];
+            Real theta_j = v_angle[j_bus];
+            Real g = g_series[br];
+            Real b = b_series[br];
+            Real a = tap_ratio[br];
+            Real phi = phase_shift[br];
+            
+            Real theta_ij = theta_i - theta_j - phi;
+            Real cos_t = cosf(theta_ij);
+            Real sin_t = sinf(theta_ij);
+            Real a2 = a * a;
+            Real inv_a = 1.0f / a;
+            
+            // Approximate: dI/dθ ≈ I/P * dP/dθ, dI/dV ≈ I/P * dP/dV - I/V
+            // Use unit scale for now
+            Real scale = 1.0f / ct;
+            
+            Real dI_dVi, dI_dVj, dI_dtheta_i, dI_dtheta_j;
+            
+            if (end == BranchEnd::FROM) {
+                // Approximate derivatives
+                dI_dtheta_i = (Vi * Vj * inv_a) * (g * sin_t - b * cos_t) * scale;
+                dI_dtheta_j = -(Vi * Vj * inv_a) * (g * sin_t - b * cos_t) * scale;
+                dI_dVi = ((2.0f * Vi / a2) * g - (Vj * inv_a) * (g * cos_t + b * sin_t)) * scale;
+                dI_dVj = (-(Vi * inv_a) * (g * cos_t + b * sin_t)) * scale;
+            } else {
+                dI_dtheta_i = (Vi * Vj * inv_a) * (-g * sin_t - b * cos_t) * scale;
+                dI_dtheta_j = -(Vi * Vj * inv_a) * (-g * sin_t - b * cos_t) * scale;
+                dI_dVi = (-(Vj * inv_a) * (g * cos_t - b * sin_t)) * scale;
+                dI_dVj = (2.0f * Vj * g - (Vi * inv_a) * (g * cos_t - b * sin_t)) * scale;
+            }
+            
+            // Write to Jacobian
+            int32_t angle_idx_i = angle_state_idx(i_bus);
+            if (angle_idx_i >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_i;
+                H_values[h_idx] = dI_dtheta_i;
+                h_idx++;
+            }
+            if (h_idx < row_end) {
+                H_col_ind[h_idx] = vmag_state_idx(i_bus);
+                H_values[h_idx] = dI_dVi;
+                h_idx++;
+            }
+            
+            int32_t angle_idx_j = angle_state_idx(j_bus);
+            if (angle_idx_j >= 0 && h_idx < row_end) {
+                H_col_ind[h_idx] = angle_idx_j;
+                H_values[h_idx] = dI_dtheta_j;
+                h_idx++;
+            }
+            if (h_idx < row_end) {
+                H_col_ind[h_idx] = vmag_state_idx(j_bus);
+                H_values[h_idx] = dI_dVj;
+            }
+            break;
+        }
             
         default:
             break;
@@ -1568,16 +2108,16 @@ cudaError_t SparseMatrixManager::computeJacobianValues(
         return cudaErrorNotReady;
     }
     
-    // Zero out H values first
-    cudaMemsetAsync(H.d_values, 0, H.nnz * sizeof(Real), stream_);
+    // Kernel now fills both col_ind and values, no need to pre-zero values
+    // but we should ensure clean state
     
     dim3 block(BLOCK_SIZE_STANDARD);
     dim3 grid = compute_grid_size(measurements.count, BLOCK_SIZE_STANDARD);
     
     computeJacobianValuesKernel<<<grid, block, 0, stream_>>>(
         H.d_values,
+        H.d_col_ind,      // Now mutable - kernel fills col indices
         H.d_row_ptr,
-        H.d_col_ind,
         measurements.d_type,
         measurements.d_location_index,
         measurements.d_branch_end,

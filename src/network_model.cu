@@ -520,6 +520,47 @@ bool NetworkModel::isBusMeasurement(MeasurementType type) const {
 }
 
 //=============================================================================
+// Result Setters (for GPU result download)
+//=============================================================================
+
+void NetworkModel::setBusVoltage(int32_t index, Real v_mag, Real v_angle) {
+    if (index >= 0 && index < static_cast<int32_t>(buses_.size())) {
+        buses_[index].v_mag = v_mag;
+        buses_[index].v_angle = v_angle;
+    }
+}
+
+void NetworkModel::setBusPower(int32_t index, Real p_inj, Real q_inj) {
+    if (index >= 0 && index < static_cast<int32_t>(buses_.size())) {
+        buses_[index].p_injection = p_inj;
+        buses_[index].q_injection = q_inj;
+    }
+}
+
+void NetworkModel::setBranchFlows(int32_t index, Real p_from, Real q_from, Real p_to, Real q_to) {
+    if (index >= 0 && index < static_cast<int32_t>(branches_.size())) {
+        branches_[index].p_flow_from = p_from;
+        branches_[index].q_flow_from = q_from;
+        branches_[index].p_flow_to = p_to;
+        branches_[index].q_flow_to = q_to;
+    }
+}
+
+void NetworkModel::setBranchCurrents(int32_t index, Real i_from, Real i_to) {
+    if (index >= 0 && index < static_cast<int32_t>(branches_.size())) {
+        branches_[index].i_mag_from = i_from;
+        branches_[index].i_mag_to = i_to;
+    }
+}
+
+void NetworkModel::setMeasurementResult(int32_t index, Real estimated, Real residual) {
+    if (index >= 0 && index < static_cast<int32_t>(measurements_.size())) {
+        measurements_[index].estimated = estimated;
+        measurements_[index].residual = residual;
+    }
+}
+
+//=============================================================================
 // HostDataAllocator Implementation
 //=============================================================================
 

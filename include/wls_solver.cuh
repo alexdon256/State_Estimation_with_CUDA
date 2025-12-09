@@ -80,6 +80,7 @@ struct SolverState {
     
     // Huber weights (for robust estimation)
     Real* d_huber_weights;          ///< Modified weights when using Huber
+    bool using_huber_weights;       ///< Flag indicating Huber weights are active
     
     // Convergence tracking
     Real* d_max_mismatch;           ///< Device-side max mismatch
@@ -97,7 +98,7 @@ struct SolverState {
         H_pattern_valid(false), G_factor_valid(false),
         d_rhs(nullptr), d_delta_x(nullptr),
         d_temp_meas(nullptr), d_temp_state(nullptr),
-        d_huber_weights(nullptr),
+        d_huber_weights(nullptr), using_huber_weights(false),
         d_max_mismatch(nullptr), d_objective(nullptr),
         d_validity_flag(nullptr),
         h_max_mismatch(0), h_objective(0), h_validity_flag(0) {

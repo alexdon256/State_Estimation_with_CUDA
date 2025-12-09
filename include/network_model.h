@@ -577,6 +577,35 @@ public:
      * @brief Apply flat start initialization (1.0 p.u., 0 deg)
      */
     void applyFlatStart();
+    
+    //=========================================================================
+    // Result Setters (for GPU result download)
+    //=========================================================================
+    
+    /**
+     * @brief Set bus voltage results from GPU
+     */
+    void setBusVoltage(int32_t index, Real v_mag, Real v_angle);
+    
+    /**
+     * @brief Set bus power injection results from GPU
+     */
+    void setBusPower(int32_t index, Real p_inj, Real q_inj);
+    
+    /**
+     * @brief Set branch flow results from GPU
+     */
+    void setBranchFlows(int32_t index, Real p_from, Real q_from, Real p_to, Real q_to);
+    
+    /**
+     * @brief Set branch current results from GPU
+     */
+    void setBranchCurrents(int32_t index, Real i_from, Real i_to);
+    
+    /**
+     * @brief Set measurement result (estimated and residual) from GPU
+     */
+    void setMeasurementResult(int32_t index, Real estimated, Real residual);
 
 private:
     // Element storage using boost::stable_vector (NFR-18)

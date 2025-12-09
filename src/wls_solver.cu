@@ -386,6 +386,9 @@ cudaError_t WLSSolver::singleIteration(
     if (use_huber) {
         err = applyHuberWeights(measurements, huber_gamma);
         if (err != cudaSuccess) return err;
+        state_->using_huber_weights = true;
+    } else {
+        state_->using_huber_weights = false;
     }
     
     // Step 4: Update Jacobian matrix H(x)
@@ -393,7 +396,9 @@ cudaError_t WLSSolver::singleIteration(
     if (err != cudaSuccess) return err;
     
     // Step 5: Form and factorize Gain matrix if needed
-    if (!state_->G_factor_valid) {
+    // NOTE: When using Huber weights, we must recompute G each iteration
+    // because the weights change with the residuals
+    if (!state_->G_factor_valid || state_->using_huber_weights) {
         err = formGainMatrix(measurements);
         if (err != cudaSuccess) return err;
     }
@@ -426,9 +431,13 @@ cudaError_t WLSSolver::computeJacobian(
 }
 
 cudaError_t WLSSolver::formGainMatrix(const DeviceMeasurementData& measurements) {
+    // Use Huber weights if active, otherwise use base weights
+    const Real* weights = state_->using_huber_weights ? 
+        state_->d_huber_weights : measurements.d_weight;
+    
     // Compute G = H^T * W * H
     cudaError_t err = matrix_mgr_->computeGainMatrix(
-        state_->H, measurements.d_weight, measurements.count, state_->G);
+        state_->H, weights, measurements.count, state_->G);
     if (err != cudaSuccess) return err;
     
     // Factorize G = L * L^T
@@ -440,6 +449,10 @@ cudaError_t WLSSolver::formGainMatrix(const DeviceMeasurementData& measurements)
 }
 
 cudaError_t WLSSolver::solveNormalEquations(const DeviceMeasurementData& measurements) {
+    // Use Huber weights if active, otherwise use base weights
+    const Real* weights = state_->using_huber_weights ? 
+        state_->d_huber_weights : measurements.d_weight;
+    
     // Compute RHS: b = H^T * W * r
     dim3 block(BLOCK_SIZE_STANDARD);
     dim3 grid = compute_grid_size(state_->n_states, BLOCK_SIZE_STANDARD);
@@ -453,7 +466,7 @@ cudaError_t WLSSolver::solveNormalEquations(const DeviceMeasurementData& measure
         state_->H.d_row_ptr,
         state_->H.d_col_ind,
         state_->H.d_values,
-        measurements.d_weight,
+        weights,
         measurements.d_residual,
         measurements.count,
         state_->n_states);
