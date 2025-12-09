@@ -1694,6 +1694,8 @@ __global__ void computeJacobianValuesKernel(
         }
         
         case MeasurementType::P_INJECTION: {
+            // P_i = Σⱼ V_i V_j [G_ij cos(θ_ij) + B_ij sin(θ_ij)]
+            // where θ_ij = θ_i - θ_j
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
             Real scale = 1.0f;  // No PT/CT scaling - all values in p.u.
@@ -1701,7 +1703,10 @@ __global__ void computeJacobianValuesKernel(
             int32_t ybus_start = ybus_row_ptr[loc];
             int32_t ybus_end = ybus_row_ptr[loc + 1];
             
-            // Compute diagonal terms first
+            // Diagonal derivatives:
+            // ∂P_i/∂V_i = 2 V_i G_ii + Σⱼ≠ᵢ V_j [G_ij cos(θ_ij) + B_ij sin(θ_ij)]
+            // ∂P_i/∂θ_i = V_i² B_ii + Σⱼ≠ᵢ V_i V_j [-G_ij sin(θ_ij) + B_ij cos(θ_ij)]
+            //           = V_i² B_ii - Σⱼ≠ᵢ V_i V_j [G_ij sin(θ_ij) - B_ij cos(θ_ij)]
             Real dP_dVi = 0.0f;
             Real dP_dtheta_i = 0.0f;
             
@@ -1717,23 +1722,28 @@ __global__ void computeJacobianValuesKernel(
                 Real sin_t = sinf(theta_ij);
                 
                 if (j == loc) {
-                    // Diagonal self-admittance contribution
+                    // Diagonal self-admittance contribution (θ_ii = 0, cos=1, sin=0)
                     dP_dVi += 2.0f * Vi * Gij;
+                    // B_ii contribution to theta derivative: V_i² * B_ii * cos(0) = V_i² B_ii
+                    dP_dtheta_i += Vi * Vi * Bij;
                 } else {
-                    // Off-diagonal terms
+                    // Off-diagonal voltage terms
                     dP_dVi += Vj * (Gij * cos_t + Bij * sin_t);
-                    dP_dtheta_i += Vi * Vj * (Gij * sin_t - Bij * cos_t);
                     
-                    // Off-diagonal angle derivative: dP_i/dtheta_j
+                    // Off-diagonal contribution to diagonal theta derivative (NEGATIVE)
+                    // ∂P_i/∂θ_i contribution from j≠i: -V_i V_j [G sin - B cos]
+                    dP_dtheta_i -= Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                    
+                    // Off-diagonal angle derivative: ∂P_i/∂θ_j = V_i V_j [G sin - B cos]
                     int32_t angle_idx = angle_state_idx(j);
                     if (angle_idx >= 0 && h_idx < row_end) {
-                        Real dP_dtheta_j = -Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                        Real dP_dtheta_j = Vi * Vj * (Gij * sin_t - Bij * cos_t);
                         H_col_ind[h_idx] = angle_idx;
                         H_values[h_idx] = dP_dtheta_j * scale;
                         h_idx++;
                     }
                     
-                    // Off-diagonal voltage derivative: dP_i/dV_j
+                    // Off-diagonal voltage derivative: ∂P_i/∂V_j = V_i [G cos + B sin]
                     if (h_idx < row_end) {
                         int32_t vmag_idx = vmag_state_idx(j);
                         Real dP_dVj = Vi * (Gij * cos_t + Bij * sin_t);
@@ -1761,6 +1771,8 @@ __global__ void computeJacobianValuesKernel(
         }
         
         case MeasurementType::Q_INJECTION: {
+            // Q_i = Σⱼ V_i V_j [G_ij sin(θ_ij) - B_ij cos(θ_ij)]
+            // where θ_ij = θ_i - θ_j
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
             Real scale = 1.0f;  // No PT/CT scaling - all values in p.u.
@@ -1768,6 +1780,9 @@ __global__ void computeJacobianValuesKernel(
             int32_t ybus_start = ybus_row_ptr[loc];
             int32_t ybus_end = ybus_row_ptr[loc + 1];
             
+            // Diagonal derivatives:
+            // ∂Q_i/∂V_i = -2 V_i B_ii + Σⱼ≠ᵢ V_j [G_ij sin(θ_ij) - B_ij cos(θ_ij)]
+            // ∂Q_i/∂θ_i = V_i² G_ii + Σⱼ≠ᵢ V_i V_j [G_ij cos(θ_ij) + B_ij sin(θ_ij)]
             Real dQ_dVi = 0.0f;
             Real dQ_dtheta_i = 0.0f;
             
@@ -1782,12 +1797,19 @@ __global__ void computeJacobianValuesKernel(
                 Real sin_t = sinf(theta_ij);
                 
                 if (j == loc) {
+                    // Diagonal self-admittance contribution (θ_ii = 0, cos=1, sin=0)
                     dQ_dVi += -2.0f * Vi * Bij;
+                    // G_ii contribution to theta derivative: V_i² * G_ii * cos(0) = V_i² G_ii
+                    dQ_dtheta_i += Vi * Vi * Gij;
                 } else {
+                    // Off-diagonal voltage terms
                     dQ_dVi += Vj * (Gij * sin_t - Bij * cos_t);
+                    
+                    // Off-diagonal contribution to diagonal theta derivative
+                    // ∂Q_i/∂θ_i contribution from j≠i: V_i V_j [G cos + B sin]
                     dQ_dtheta_i += Vi * Vj * (Gij * cos_t + Bij * sin_t);
                     
-                    // dQ_i/dtheta_j
+                    // Off-diagonal angle derivative: ∂Q_i/∂θ_j = -V_i V_j [G cos + B sin]
                     int32_t angle_idx = angle_state_idx(j);
                     if (angle_idx >= 0 && h_idx < row_end) {
                         Real dQ_dtheta_j = -Vi * Vj * (Gij * cos_t + Bij * sin_t);
@@ -1796,7 +1818,7 @@ __global__ void computeJacobianValuesKernel(
                         h_idx++;
                     }
                     
-                    // dQ_i/dV_j
+                    // Off-diagonal voltage derivative: ∂Q_i/∂V_j = V_i [G sin - B cos]
                     if (h_idx < row_end) {
                         int32_t vmag_idx = vmag_state_idx(j);
                         Real dQ_dVj = Vi * (Gij * sin_t - Bij * cos_t);
@@ -1904,7 +1926,8 @@ __global__ void computeJacobianValuesKernel(
         }
         
         case MeasurementType::P_PSEUDO: {
-            // Zero injection P: same Jacobian structure as P_INJECTION, no scale
+            // Zero injection P: same Jacobian structure as P_INJECTION
+            // P_i = Σⱼ V_i V_j [G_ij cos(θ_ij) + B_ij sin(θ_ij)]
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
             
@@ -1925,14 +1948,18 @@ __global__ void computeJacobianValuesKernel(
                 Real sin_t = sinf(theta_ij);
                 
                 if (j_bus == loc) {
+                    // Diagonal self-admittance (θ_ii = 0)
                     dP_dVi += 2.0f * Vi * Gij;
+                    dP_dtheta_i += Vi * Vi * Bij;  // B_ii contribution
                 } else {
                     dP_dVi += Vj * (Gij * cos_t + Bij * sin_t);
-                    dP_dtheta_i += Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                    // NEGATIVE for diagonal theta (correct sign)
+                    dP_dtheta_i -= Vi * Vj * (Gij * sin_t - Bij * cos_t);
                     
+                    // Off-diagonal: ∂P_i/∂θ_j = +V_i V_j [G sin - B cos]
                     int32_t angle_idx = angle_state_idx(j_bus);
                     if (angle_idx >= 0 && h_idx < row_end) {
-                        Real dP_dtheta_j = -Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                        Real dP_dtheta_j = Vi * Vj * (Gij * sin_t - Bij * cos_t);
                         H_col_ind[h_idx] = angle_idx;
                         H_values[h_idx] = dP_dtheta_j;
                         h_idx++;
@@ -1964,7 +1991,8 @@ __global__ void computeJacobianValuesKernel(
         }
         
         case MeasurementType::Q_PSEUDO: {
-            // Zero injection Q: same Jacobian structure as Q_INJECTION, no scale
+            // Zero injection Q: same Jacobian structure as Q_INJECTION
+            // Q_i = Σⱼ V_i V_j [G_ij sin(θ_ij) - B_ij cos(θ_ij)]
             Real Vi = v_mag[loc];
             Real theta_i = v_angle[loc];
             
@@ -1985,11 +2013,14 @@ __global__ void computeJacobianValuesKernel(
                 Real sin_t = sinf(theta_ij);
                 
                 if (j_bus == loc) {
+                    // Diagonal self-admittance (θ_ii = 0)
                     dQ_dVi += -2.0f * Vi * Bij;
+                    dQ_dtheta_i += Vi * Vi * Gij;  // G_ii contribution
                 } else {
                     dQ_dVi += Vj * (Gij * sin_t - Bij * cos_t);
                     dQ_dtheta_i += Vi * Vj * (Gij * cos_t + Bij * sin_t);
                     
+                    // Off-diagonal: ∂Q_i/∂θ_j = -V_i V_j [G cos + B sin]
                     int32_t angle_idx = angle_state_idx(j_bus);
                     if (angle_idx >= 0 && h_idx < row_end) {
                         Real dQ_dtheta_j = -Vi * Vj * (Gij * cos_t + Bij * sin_t);
