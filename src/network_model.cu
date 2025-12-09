@@ -135,7 +135,9 @@ int32_t NetworkModel::addMeasurement(const MeasurementDescriptor& desc) {
     MeasurementElement elem(index);
     elem.descriptor = desc;
     elem.location_index = loc_idx;
-    elem.weight = 1.0f / (desc.sigma * desc.sigma);  // Weight = 1/variance
+    // Safeguard: clamp sigma to minimum value to avoid division by zero
+    Real safe_sigma = std::max(desc.sigma, SLE_REAL_EPSILON);
+    elem.weight = 1.0f / (safe_sigma * safe_sigma);  // Weight = 1/variance
     elem.is_active = true;
     
     measurements_.push_back(elem);

@@ -277,9 +277,11 @@ __global__ void computeBranchFlowsKernel(
     sincosf(theta_ij, &sin_theta, &cos_theta);
     
     // Precompute common terms (reduces total operations)
-    Real a2 = a * a;
+    // Safeguard: clamp tap ratio to avoid division by zero
+    Real a_safe = fmaxf(a, SLE_REAL_EPSILON);
+    Real a2 = a_safe * a_safe;
     Real inv_a2 = 1.0f / a2;
-    Real inv_a = 1.0f / a;
+    Real inv_a = 1.0f / a_safe;
     
     Real Vi2 = Vi * Vi;
     Real Vj2 = Vj * Vj;
@@ -398,8 +400,9 @@ __global__ void computeMeasurementFunctionKernel(
     MeasurementType type = meas_type[m];
     int32_t loc = location_index[m];
     BranchEnd end = branch_end[m];
-    Real pt = pt_ratio[m];
-    Real ct = ct_ratio[m];
+    // Safeguard against division by zero: clamp ratios to minimum value
+    Real pt = fmaxf(pt_ratio[m], SLE_REAL_EPSILON);
+    Real ct = fmaxf(ct_ratio[m], SLE_REAL_EPSILON);
     
     Real h = 0.0f;
     

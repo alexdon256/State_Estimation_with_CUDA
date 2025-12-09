@@ -193,8 +193,11 @@ void WLSSolver::freeSolverState() {
     if (state_->d_objective) cudaFree(state_->d_objective);
     if (state_->d_validity_flag) cudaFree(state_->d_validity_flag);
     
-    matrix_mgr_->freeCSR(state_->H);
-    matrix_mgr_->freeCSR(state_->G);
+    // Null check for matrix_mgr_ (may be null after move)
+    if (matrix_mgr_) {
+        matrix_mgr_->freeCSR(state_->H);
+        matrix_mgr_->freeCSR(state_->G);
+    }
     
     state_.reset();
 }

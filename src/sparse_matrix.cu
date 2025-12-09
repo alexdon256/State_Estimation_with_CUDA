@@ -423,7 +423,8 @@ __global__ void fillYbusKernel(
     
     Real g = g_series[k];
     Real b = b_series[k];
-    Real a = tap_ratio[k];
+    // Safeguard: clamp tap ratio to avoid division by zero
+    Real a = fmaxf(tap_ratio[k], SLE_REAL_EPSILON);
     Real phi = phase_shift[k];
     
     Real a2 = a * a;
@@ -1653,8 +1654,9 @@ __global__ void computeJacobianValuesKernel(
     
     MeasurementType type = meas_type[m];
     int32_t loc = location_index[m];
-    Real pt = pt_ratio[m];
-    Real ct = ct_ratio[m];
+    // Safeguard against division by zero
+    Real pt = fmaxf(pt_ratio[m], SLE_REAL_EPSILON);
+    Real ct = fmaxf(ct_ratio[m], SLE_REAL_EPSILON);
     
     // Helper lambda to convert bus index to angle state index
     // Returns -1 if bus is slack (no angle state)
@@ -1833,7 +1835,8 @@ __global__ void computeJacobianValuesKernel(
             Real theta_j = v_angle[j_bus];
             Real g = g_series[br];
             Real b = b_series[br];
-            Real a = tap_ratio[br];
+            // Safeguard: clamp tap ratio to avoid division by zero
+            Real a = fmaxf(tap_ratio[br], SLE_REAL_EPSILON);
             Real phi = phase_shift[br];
             
             Real theta_ij = theta_i - theta_j - phi;
@@ -2038,7 +2041,8 @@ __global__ void computeJacobianValuesKernel(
             Real theta_j = v_angle[j_bus];
             Real g = g_series[br];
             Real b = b_series[br];
-            Real a = tap_ratio[br];
+            // Safeguard: clamp tap ratio to avoid division by zero
+            Real a = fmaxf(tap_ratio[br], SLE_REAL_EPSILON);
             Real phi = phase_shift[br];
             
             Real theta_ij = theta_i - theta_j - phi;

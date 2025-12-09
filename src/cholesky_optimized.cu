@@ -522,15 +522,32 @@ cudaError_t OptimizedCholeskySolver::solveMultiple(
         int32_t num_streams = std::min(nrhs, MAX_CONCURRENT);
         
         // Create temporary streams for parallel execution
-        std::vector<cudaStream_t> streams(num_streams);
+        std::vector<cudaStream_t> streams(num_streams, nullptr);
         for (int32_t s = 0; s < num_streams; ++s) {
-            cudaStreamCreate(&streams[s]);
+            cudaError_t err = cudaStreamCreate(&streams[s]);
+            if (err != cudaSuccess) {
+                // Cleanup already created streams
+                for (int32_t j = 0; j < s; ++j) {
+                    cudaStreamDestroy(streams[j]);
+                }
+                return err;
+            }
         }
         
         // Allocate temporary buffers for each stream
-        std::vector<Real*> d_temp_buffers(num_streams);
+        std::vector<Real*> d_temp_buffers(num_streams, nullptr);
         for (int32_t s = 0; s < num_streams; ++s) {
-            cudaMalloc(&d_temp_buffers[s], current_n_ * sizeof(Real));
+            cudaError_t err = cudaMalloc(&d_temp_buffers[s], current_n_ * sizeof(Real));
+            if (err != cudaSuccess) {
+                // Cleanup already allocated buffers and all streams
+                for (int32_t j = 0; j < s; ++j) {
+                    cudaFree(d_temp_buffers[j]);
+                }
+                for (int32_t j = 0; j < num_streams; ++j) {
+                    cudaStreamDestroy(streams[j]);
+                }
+                return err;
+            }
         }
         
         // Process RHS in batches across streams
