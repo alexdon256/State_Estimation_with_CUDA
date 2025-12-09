@@ -294,7 +294,7 @@ block_size_standard = 256         # CUDA block size for kernels
 
 ## Author
 
-**Oleksandr Don** — [GitHub](https://github.com/youruser)
+**Oleksandr Don** — [GitHub](https://github.com/alexdon256)
 
 ## License
 
