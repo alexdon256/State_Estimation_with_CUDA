@@ -371,10 +371,35 @@ __global__ void countYbusNonzerosKernel(
     atomicAdd(&row_counts[j], 1);  // Off-diagonal Y_ji
 }
 
+/**
+ * @brief Kernel to initialize Ybus diagonals (called once per bus)
+ */
+__global__ void initYbusDiagonalKernel(
+    Real* __restrict__ g_values,
+    Real* __restrict__ b_values,
+    int32_t* __restrict__ col_ind,
+    const int32_t* __restrict__ row_ptr,
+    int32_t n_buses)
+{
+    int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_buses) return;
+    
+    // Each bus has its diagonal as first entry in its row
+    int32_t diag_pos = row_ptr[i];
+    col_ind[diag_pos] = i;  // Diagonal column index
+    g_values[diag_pos] = 0.0f;
+    b_values[diag_pos] = 0.0f;
+}
+
+/**
+ * @brief Kernel to fill Ybus off-diagonal entries and add to diagonals
+ * Each branch contributes to 4 entries: Y_ii, Y_jj (diag), Y_ij, Y_ji (off-diag)
+ */
 __global__ void fillYbusKernel(
     Real* __restrict__ g_values,
     Real* __restrict__ b_values,
     int32_t* __restrict__ col_ind,
+    int32_t* __restrict__ row_offset_counter,  // Atomic counter for each row's current write position
     const int32_t* __restrict__ row_ptr,
     const int32_t* __restrict__ from_bus,
     const int32_t* __restrict__ to_bus,
@@ -388,8 +413,6 @@ __global__ void fillYbusKernel(
     int32_t n_branches,
     int32_t n_buses)
 {
-    // This kernel fills Ybus values for one branch
-    // Uses atomic operations to handle concurrent updates to same row
     int32_t k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= n_branches) return;
     
@@ -404,41 +427,55 @@ __global__ void fillYbusKernel(
     Real phi = phase_shift[k];
     
     Real a2 = a * a;
+    Real inv_a = 1.0f / a;
     Real cos_phi = cosf(phi);
     Real sin_phi = sinf(phi);
     
-    // Off-diagonal elements Y_ij = -y_ij / a * e^(j*phi)
-    // Y_ij_real = -(g*cos(phi) + b*sin(phi)) / a
-    // Y_ij_imag = -(g*sin(phi) - b*cos(phi)) / a
-    // Note: Off-diagonal terms computed but not used yet (placeholder for full Ybus build)
-    (void)(-(g * cos_phi + b * sin_phi) / a);  // Y_ij_g
-    (void)(-(-g * sin_phi + b * cos_phi) / a); // Y_ij_b
+    // Off-diagonal Y_ij = -(g + jb) / a * e^(-j*phi)
+    // For transformer: Y_ij = -y * e^(-j*phi) / a
+    Real Y_ij_g = -(g * cos_phi + b * sin_phi) * inv_a;
+    Real Y_ij_b = -(-g * sin_phi + b * cos_phi) * inv_a;
     
-    // Off-diagonal Y_ji = -y_ij / a * e^(-j*phi)
-    (void)(-(g * cos_phi - b * sin_phi) / a);  // Y_ji_g
-    (void)(-(g * sin_phi + b * cos_phi) / a);  // Y_ji_b
+    // Off-diagonal Y_ji = -(g + jb) / a * e^(j*phi)
+    Real Y_ji_g = -(g * cos_phi - b * sin_phi) * inv_a;
+    Real Y_ji_b = -(g * sin_phi + b * cos_phi) * inv_a;
     
     // Diagonal contributions
-    // Y_ii += y_ij/a^2 + j*b_sh_from
-    Real Y_ii_g = g / a2;
-    Real Y_ii_b = b / a2 + b_shunt_from[k];
+    // Y_ii += y/a^2 + j*b_sh_from/2
+    Real Y_ii_g_contrib = g / a2;
+    Real Y_ii_b_contrib = b / a2 + b_shunt_from[k];
     
-    // Y_jj += y_ij + j*b_sh_to
-    Real Y_jj_g = g;
-    Real Y_jj_b = b + b_shunt_to[k];
+    // Y_jj += y + j*b_sh_to/2
+    Real Y_jj_g_contrib = g;
+    Real Y_jj_b_contrib = b + b_shunt_to[k];
     
-    // Add contributions using atomics
-    // This is simplified - in practice need proper CSR filling with sorted insertion
-    // For now, we atomically add to diagonal elements
-    
-    // Find diagonal positions (assuming diagonal is at start of each row)
+    // Atomic add to diagonal entries (position 0 in each row)
     int32_t diag_i = row_ptr[i];
     int32_t diag_j = row_ptr[j];
     
-    atomicAdd(&g_values[diag_i], Y_ii_g);
-    atomicAdd(&b_values[diag_i], Y_ii_b);
-    atomicAdd(&g_values[diag_j], Y_jj_g);
-    atomicAdd(&b_values[diag_j], Y_jj_b);
+    atomicAdd(&g_values[diag_i], Y_ii_g_contrib);
+    atomicAdd(&b_values[diag_i], Y_ii_b_contrib);
+    atomicAdd(&g_values[diag_j], Y_jj_g_contrib);
+    atomicAdd(&b_values[diag_j], Y_jj_b_contrib);
+    
+    // Add off-diagonal entries Y_ij (in row i) and Y_ji (in row j)
+    // Get next available position in each row using atomic increment
+    int32_t pos_in_row_i = atomicAdd(&row_offset_counter[i], 1);
+    int32_t pos_in_row_j = atomicAdd(&row_offset_counter[j], 1);
+    
+    // Off-diagonal position is after diagonal (diag is at row_ptr[bus])
+    int32_t off_diag_pos_i = row_ptr[i] + 1 + pos_in_row_i;
+    int32_t off_diag_pos_j = row_ptr[j] + 1 + pos_in_row_j;
+    
+    // Fill Y_ij (row i, column j)
+    col_ind[off_diag_pos_i] = j;
+    g_values[off_diag_pos_i] = Y_ij_g;
+    b_values[off_diag_pos_i] = Y_ij_b;
+    
+    // Fill Y_ji (row j, column i)
+    col_ind[off_diag_pos_j] = i;
+    g_values[off_diag_pos_j] = Y_ji_g;
+    b_values[off_diag_pos_j] = Y_ji_b;
 }
 
 //=============================================================================
@@ -453,10 +490,11 @@ cudaError_t SparseMatrixManager::buildYbus(
     int32_t n_buses = buses.count;
     int32_t n_branches = branches.count;
     
-    // Step 1: Compute branch admittances
     dim3 block(BLOCK_SIZE_STANDARD);
     dim3 grid_branches = compute_grid_size(n_branches, BLOCK_SIZE_STANDARD);
+    dim3 grid_buses = compute_grid_size(n_buses, BLOCK_SIZE_STANDARD);
     
+    // Step 1: Compute branch admittances
     computeBranchAdmittanceKernel<<<grid_branches, block, 0, stream_>>>(
         branches.d_g_series,
         branches.d_b_series,
@@ -469,15 +507,15 @@ cudaError_t SparseMatrixManager::buildYbus(
         n_branches);
     
     // Step 2: Count non-zeros per row
-    // Allocate temporary row count array
+    // Each bus has diagonal (1) + number of connected branches
     int32_t* d_row_counts;
     cudaMalloc(&d_row_counts, n_buses * sizeof(int32_t));
-    cudaMemsetAsync(d_row_counts, 0, n_buses * sizeof(int32_t), stream_);
     
-    // Each bus has at least itself (diagonal)
-    fillVectorKernel<<<compute_grid_size(n_buses, BLOCK_SIZE_STANDARD), block, 0, stream_>>>(
-        reinterpret_cast<Real*>(d_row_counts), 1.0f, n_buses);
+    // Initialize to 1 for diagonal
+    thrust::device_ptr<int32_t> d_counts_ptr(d_row_counts);
+    thrust::fill(thrust::cuda::par.on(stream_), d_counts_ptr, d_counts_ptr + n_buses, 1);
     
+    // Add off-diagonal counts from branches
     countYbusNonzerosKernel<<<grid_branches, block, 0, stream_>>>(
         d_row_counts,
         branches.d_from_bus,
@@ -486,48 +524,70 @@ cudaError_t SparseMatrixManager::buildYbus(
         n_branches,
         n_buses);
     
+    cudaStreamSynchronize(stream_);
+    
     // Step 3: Compute row pointers via exclusive scan
-    thrust::device_ptr<int32_t> d_counts_ptr(d_row_counts);
+    // First, allocate row_ptr if needed
+    if (!ybus.d_row_ptr) {
+        cudaMalloc(&ybus.d_row_ptr, (n_buses + 1) * sizeof(int32_t));
+    }
+    
     thrust::device_ptr<int32_t> d_row_ptr_ptr(ybus.d_row_ptr);
     
-    // Exclusive scan to get row pointers
+    // Exclusive scan: row_ptr[i] = sum of row_counts[0..i-1]
     thrust::exclusive_scan(thrust::cuda::par.on(stream_),
-                          d_counts_ptr, d_counts_ptr + n_buses,
+                          d_counts_ptr, d_counts_ptr + n_buses + 1,
                           d_row_ptr_ptr);
     
-    // Copy total to last element
-    int32_t total_nnz;
-    cudaMemcpy(&total_nnz, d_row_counts + n_buses - 1, sizeof(int32_t),
+    // Compute total nnz
+    int32_t total_nnz = 0;
+    std::vector<int32_t> h_row_counts(n_buses);
+    cudaMemcpy(h_row_counts.data(), d_row_counts, n_buses * sizeof(int32_t),
                cudaMemcpyDeviceToHost);
-    int32_t last_row_ptr;
-    cudaMemcpy(&last_row_ptr, ybus.d_row_ptr + n_buses - 1, sizeof(int32_t),
-               cudaMemcpyDeviceToHost);
-    total_nnz += last_row_ptr;
+    for (int32_t i = 0; i < n_buses; ++i) {
+        total_nnz += h_row_counts[i];
+    }
+    
+    // Set last row_ptr element
     cudaMemcpy(ybus.d_row_ptr + n_buses, &total_nnz, sizeof(int32_t),
                cudaMemcpyHostToDevice);
     
     ybus.nnz = total_nnz;
+    ybus.n_buses = n_buses;
     
-    // Step 4: Reallocate if needed
-    if (ybus.nnz > 0) {
-        // Free old and allocate new
-        cudaFree(ybus.d_col_ind);
-        cudaFree(ybus.d_g_values);
-        cudaFree(ybus.d_b_values);
-        
-        cudaMalloc(&ybus.d_col_ind, ybus.nnz * sizeof(int32_t));
-        cudaMalloc(&ybus.d_g_values, ybus.nnz * sizeof(Real));
-        cudaMalloc(&ybus.d_b_values, ybus.nnz * sizeof(Real));
-        
-        cudaMemsetAsync(ybus.d_g_values, 0, ybus.nnz * sizeof(Real), stream_);
-        cudaMemsetAsync(ybus.d_b_values, 0, ybus.nnz * sizeof(Real), stream_);
-    }
+    // Step 4: Reallocate value arrays if needed
+    if (ybus.d_col_ind) cudaFree(ybus.d_col_ind);
+    if (ybus.d_g_values) cudaFree(ybus.d_g_values);
+    if (ybus.d_b_values) cudaFree(ybus.d_b_values);
     
-    // Step 5: Fill Ybus values
+    cudaMalloc(&ybus.d_col_ind, total_nnz * sizeof(int32_t));
+    cudaMalloc(&ybus.d_g_values, total_nnz * sizeof(Real));
+    cudaMalloc(&ybus.d_b_values, total_nnz * sizeof(Real));
+    
+    // Initialize to zero
+    cudaMemsetAsync(ybus.d_col_ind, 0, total_nnz * sizeof(int32_t), stream_);
+    cudaMemsetAsync(ybus.d_g_values, 0, total_nnz * sizeof(Real), stream_);
+    cudaMemsetAsync(ybus.d_b_values, 0, total_nnz * sizeof(Real), stream_);
+    
+    // Step 5: Allocate and initialize row offset counter for off-diagonal insertion
+    int32_t* d_row_offset_counter;
+    cudaMalloc(&d_row_offset_counter, n_buses * sizeof(int32_t));
+    cudaMemsetAsync(d_row_offset_counter, 0, n_buses * sizeof(int32_t), stream_);
+    
+    // Step 6: Initialize diagonal entries
+    initYbusDiagonalKernel<<<grid_buses, block, 0, stream_>>>(
+        ybus.d_g_values,
+        ybus.d_b_values,
+        ybus.d_col_ind,
+        ybus.d_row_ptr,
+        n_buses);
+    
+    // Step 7: Fill Ybus values (diagonal contributions + off-diagonals)
     fillYbusKernel<<<grid_branches, block, 0, stream_>>>(
         ybus.d_g_values,
         ybus.d_b_values,
         ybus.d_col_ind,
+        d_row_offset_counter,
         ybus.d_row_ptr,
         branches.d_from_bus,
         branches.d_to_bus,
@@ -541,7 +601,11 @@ cudaError_t SparseMatrixManager::buildYbus(
         n_branches,
         n_buses);
     
+    // Cleanup
     cudaFree(d_row_counts);
+    cudaFree(d_row_offset_counter);
+    
+    cudaStreamSynchronize(stream_);
     
     ybus.is_valid = true;
     return cudaGetLastError();
@@ -820,62 +884,331 @@ cudaError_t SparseMatrixManager::solveCholesky(
 // Gain Matrix Computation
 //=============================================================================
 
+/**
+ * @brief Kernel to apply sqrt(W) scaling to H values
+ * Creates H_w where H_w[i,j] = sqrt(W[i]) * H[i,j]
+ */
+__global__ void applyWeightScalingKernel(
+    Real* __restrict__ scaled_values,
+    const Real* __restrict__ values,
+    const Real* __restrict__ weights,
+    const int32_t* __restrict__ row_ptr,
+    int32_t n_rows)
+{
+    int32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    
+    Real sqrt_w = sqrtf(fmaxf(weights[row], SLE_REAL_EPSILON));
+    
+    int32_t row_start = row_ptr[row];
+    int32_t row_end = row_ptr[row + 1];
+    
+    for (int32_t idx = row_start; idx < row_end; ++idx) {
+        scaled_values[idx] = sqrt_w * values[idx];
+    }
+}
+
 cudaError_t SparseMatrixManager::computeGainMatrix(
     const DeviceCSRMatrix& H,
     const Real* weights,
     int32_t num_weights,
     DeviceCSRMatrix& G)
 {
-    // Suppress unused parameter warnings - weights will be used in full implementation
-    (void)weights;
-    (void)num_weights;
-    (void)G;  // Output will be filled in full implementation
+    if (H.nnz == 0 || H.rows == 0 || H.cols == 0) {
+        return cudaErrorInvalidValue;
+    }
     
-    // G = H^T * W * H
-    // First apply sqrt(W) to H to get H_w = sqrt(W) * H
-    // Then G = H_w^T * H_w
-    
-    // For now, use cuSPARSE SpGEMM
-    // This is a placeholder - full implementation requires:
-    // 1. Apply weight scaling to H
-    // 2. Compute H^T
-    // 3. SpGEMM: G = H^T * H_weighted
-    
-    cusparseSpMatDescr_t matH, matG_desc;
+    cudaError_t cuda_err;
+    cusparseStatus_t sparse_err;
     
 #ifdef SLE_USE_DOUBLE
     cudaDataType data_type = CUDA_R_64F;
+    cudaDataType compute_type = CUDA_R_64F;
 #else
     cudaDataType data_type = CUDA_R_32F;
+    cudaDataType compute_type = CUDA_R_32F;
 #endif
     
-    // Create H matrix descriptor
-    cusparseCreateCsr(&matH, H.rows, H.cols, H.nnz,
-                      H.d_row_ptr, H.d_col_ind, H.d_values,
-                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                      CUSPARSE_INDEX_BASE_ZERO, data_type);
+    // Step 1: Apply weight scaling to H -> H_w = sqrt(W) * H
+    Real* d_scaled_values;
+    cuda_err = cudaMalloc(&d_scaled_values, H.nnz * sizeof(Real));
+    if (cuda_err != cudaSuccess) return cuda_err;
     
-    // Create H^T by creating CSC view of H (which is CSR of H^T)
-    // For simplicity, we create a new transposed matrix
-    // In production, use cusparseCsr2cscEx2 for efficient transpose
+    dim3 block(BLOCK_SIZE_STANDARD);
+    dim3 grid = compute_grid_size(H.rows, BLOCK_SIZE_STANDARD);
     
+    applyWeightScalingKernel<<<grid, block, 0, stream_>>>(
+        d_scaled_values,
+        H.d_values,
+        weights,
+        H.d_row_ptr,
+        H.rows);
+    
+    cuda_err = cudaGetLastError();
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_scaled_values);
+        return cuda_err;
+    }
+    
+    // Step 2: Create CSC representation of H_w (which is CSR of H_w^T)
+    // Using cusparseCsr2cscEx2 for efficient transpose
+    int32_t* d_HT_row_ptr;  // This will be H^T's row_ptr (H's col_ptr in CSC)
+    int32_t* d_HT_col_ind;  // This will be H^T's col_ind (H's row indices)
+    Real* d_HT_values;
+    
+    cuda_err = cudaMalloc(&d_HT_row_ptr, (H.cols + 1) * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) { cudaFree(d_scaled_values); return cuda_err; }
+    
+    cuda_err = cudaMalloc(&d_HT_col_ind, H.nnz * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) { 
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        return cuda_err; 
+    }
+    
+    cuda_err = cudaMalloc(&d_HT_values, H.nnz * sizeof(Real));
+    if (cuda_err != cudaSuccess) { 
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); cudaFree(d_HT_col_ind);
+        return cuda_err; 
+    }
+    
+    // Determine buffer size for transpose
+    size_t buffer_size;
+    sparse_err = cusparseCsr2cscEx2_bufferSize(
+        cusparse_handle_,
+        H.rows, H.cols, H.nnz,
+        d_scaled_values, H.d_row_ptr, H.d_col_ind,
+        d_HT_values, d_HT_row_ptr, d_HT_col_ind,
+        data_type, CUSPARSE_ACTION_NUMERIC,
+        CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG1,
+        &buffer_size);
+    
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    cuda_err = ensureSpGEMMBuffer(buffer_size);
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cuda_err;
+    }
+    
+    // Execute transpose (CSR to CSC, which gives us H^T in CSR form)
+    sparse_err = cusparseCsr2cscEx2(
+        cusparse_handle_,
+        H.rows, H.cols, H.nnz,
+        d_scaled_values, H.d_row_ptr, H.d_col_ind,
+        d_HT_values, d_HT_row_ptr, d_HT_col_ind,
+        data_type, CUSPARSE_ACTION_NUMERIC,
+        CUSPARSE_INDEX_BASE_ZERO, CUSPARSE_CSR2CSC_ALG1,
+        spgemm_buffer_);
+    
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    // Step 3: Compute G = H^T * H_w using SpGEMM
+    cusparseSpMatDescr_t matHT, matHw, matG;
+    
+    // Create H^T matrix descriptor (cols x rows)
+    sparse_err = cusparseCreateCsr(&matHT, H.cols, H.rows, H.nnz,
+                                   d_HT_row_ptr, d_HT_col_ind, d_HT_values,
+                                   CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                   CUSPARSE_INDEX_BASE_ZERO, data_type);
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    // Create H_w matrix descriptor (rows x cols)
+    sparse_err = cusparseCreateCsr(&matHw, H.rows, H.cols, H.nnz,
+                                   H.d_row_ptr, H.d_col_ind, d_scaled_values,
+                                   CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                   CUSPARSE_INDEX_BASE_ZERO, data_type);
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cusparseDestroySpMat(matHT);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    // Create G matrix descriptor (cols x cols) - will be filled by SpGEMM
+    sparse_err = cusparseCreateCsr(&matG, H.cols, H.cols, 0,
+                                   nullptr, nullptr, nullptr,
+                                   CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                   CUSPARSE_INDEX_BASE_ZERO, data_type);
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    // Create SpGEMM descriptor
     cusparseSpGEMMDescr_t spgemmDesc;
-    cusparseSpGEMM_createDescr(&spgemmDesc);
+    sparse_err = cusparseSpGEMM_createDescr(&spgemmDesc);
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
     
-    // Placeholder for output matrix
-    cusparseCreateCsr(&matG_desc, H.cols, H.cols, 0,
-                      nullptr, nullptr, nullptr,
-                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                      CUSPARSE_INDEX_BASE_ZERO, data_type);
+    Real alpha = 1.0f;
+    Real beta = 0.0f;
     
-    // SpGEMM work estimation and execution would go here
-    // This is complex and requires multiple steps
+    // Work estimation phase
+    size_t buffer1_size, buffer2_size;
+    sparse_err = cusparseSpGEMM_workEstimation(
+        cusparse_handle_, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matHT, matHw, &beta, matG,
+        compute_type, CUSPARSE_SPGEMM_DEFAULT,
+        spgemmDesc, &buffer1_size, nullptr);
     
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cusparseSpGEMM_destroyDescr(spgemmDesc);
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    void* d_buffer1;
+    cuda_err = cudaMalloc(&d_buffer1, buffer1_size);
+    if (cuda_err != cudaSuccess) {
+        cusparseSpGEMM_destroyDescr(spgemmDesc);
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cuda_err;
+    }
+    
+    sparse_err = cusparseSpGEMM_workEstimation(
+        cusparse_handle_, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matHT, matHw, &beta, matG,
+        compute_type, CUSPARSE_SPGEMM_DEFAULT,
+        spgemmDesc, &buffer1_size, d_buffer1);
+    
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cudaFree(d_buffer1);
+        cusparseSpGEMM_destroyDescr(spgemmDesc);
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    // Compute phase
+    sparse_err = cusparseSpGEMM_compute(
+        cusparse_handle_, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matHT, matHw, &beta, matG,
+        compute_type, CUSPARSE_SPGEMM_DEFAULT,
+        spgemmDesc, &buffer2_size, nullptr);
+    
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cudaFree(d_buffer1);
+        cusparseSpGEMM_destroyDescr(spgemmDesc);
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    void* d_buffer2;
+    cuda_err = cudaMalloc(&d_buffer2, buffer2_size);
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_buffer1);
+        cusparseSpGEMM_destroyDescr(spgemmDesc);
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cuda_err;
+    }
+    
+    sparse_err = cusparseSpGEMM_compute(
+        cusparse_handle_, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matHT, matHw, &beta, matG,
+        compute_type, CUSPARSE_SPGEMM_DEFAULT,
+        spgemmDesc, &buffer2_size, d_buffer2);
+    
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        cudaFree(d_buffer1);
+        cudaFree(d_buffer2);
+        cusparseSpGEMM_destroyDescr(spgemmDesc);
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cudaErrorUnknown;
+    }
+    
+    // Get result dimensions
+    int64_t G_rows, G_cols, G_nnz;
+    cusparseSpMatGetSize(matG, &G_rows, &G_cols, &G_nnz);
+    
+    // Allocate G's arrays
+    freeCSR(G);
+    cuda_err = allocateCSR(G, static_cast<int32_t>(G_rows), static_cast<int32_t>(G_cols), 
+                           static_cast<int32_t>(G_nnz));
+    if (cuda_err != cudaSuccess) {
+        cudaFree(d_buffer1);
+        cudaFree(d_buffer2);
+        cusparseSpGEMM_destroyDescr(spgemmDesc);
+        cusparseDestroySpMat(matHT);
+        cusparseDestroySpMat(matHw);
+        cusparseDestroySpMat(matG);
+        cudaFree(d_scaled_values); cudaFree(d_HT_row_ptr); 
+        cudaFree(d_HT_col_ind); cudaFree(d_HT_values);
+        return cuda_err;
+    }
+    
+    // Update matG with actual pointers
+    cusparseCsrSetPointers(matG, G.d_row_ptr, G.d_col_ind, G.d_values);
+    
+    // Copy results
+    sparse_err = cusparseSpGEMM_copy(
+        cusparse_handle_, CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matHT, matHw, &beta, matG,
+        compute_type, CUSPARSE_SPGEMM_DEFAULT,
+        spgemmDesc);
+    
+    // Cleanup
+    cudaFree(d_buffer1);
+    cudaFree(d_buffer2);
     cusparseSpGEMM_destroyDescr(spgemmDesc);
-    cusparseDestroySpMat(matH);
-    cusparseDestroySpMat(matG_desc);
+    cusparseDestroySpMat(matHT);
+    cusparseDestroySpMat(matHw);
+    cusparseDestroySpMat(matG);
+    cudaFree(d_scaled_values);
+    cudaFree(d_HT_row_ptr);
+    cudaFree(d_HT_col_ind);
+    cudaFree(d_HT_values);
     
-    return cudaGetLastError();
+    if (sparse_err != CUSPARSE_STATUS_SUCCESS) {
+        return cudaErrorUnknown;
+    }
+    
+    factor_valid_ = false;  // New G means old factor is invalid
+    return cudaSuccess;
 }
 
 //=============================================================================
@@ -916,6 +1249,314 @@ cudaError_t SparseMatrixManager::analyzeJacobianPattern(
     return cudaSuccess;
 }
 
+/**
+ * @brief Kernel to compute Jacobian values for all measurement types
+ * 
+ * State variable layout:
+ * - States 0 to n_buses-2: voltage angles (skip slack bus)
+ * - States n_buses-1 to 2*n_buses-2: voltage magnitudes
+ */
+__global__ void computeJacobianValuesKernel(
+    Real* __restrict__ H_values,
+    const int32_t* __restrict__ H_row_ptr,
+    const int32_t* __restrict__ H_col_ind,
+    const MeasurementType* __restrict__ meas_type,
+    const int32_t* __restrict__ location_index,
+    const BranchEnd* __restrict__ branch_end,
+    const Real* __restrict__ pt_ratio,
+    const Real* __restrict__ ct_ratio,
+    const bool* __restrict__ is_active,
+    const Real* __restrict__ v_mag,
+    const Real* __restrict__ v_angle,
+    const int32_t* __restrict__ ybus_row_ptr,
+    const int32_t* __restrict__ ybus_col_ind,
+    const Real* __restrict__ ybus_g,
+    const Real* __restrict__ ybus_b,
+    const int32_t* __restrict__ from_bus,
+    const int32_t* __restrict__ to_bus,
+    const Real* __restrict__ g_series,
+    const Real* __restrict__ b_series,
+    const Real* __restrict__ tap_ratio,
+    const Real* __restrict__ phase_shift,
+    int32_t slack_index,
+    int32_t n_buses,
+    int32_t n_meas)
+{
+    int32_t m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= n_meas || !is_active[m]) return;
+    
+    MeasurementType type = meas_type[m];
+    int32_t loc = location_index[m];
+    Real pt = pt_ratio[m];
+    Real ct = ct_ratio[m];
+    int32_t row_start = H_row_ptr[m];
+    
+    // Helper lambda to convert bus index to angle state index
+    // Returns -1 if bus is slack (no angle state)
+    auto angle_state_idx = [slack_index, n_buses](int32_t bus) -> int32_t {
+        if (bus == slack_index) return -1;
+        return (bus < slack_index) ? bus : bus - 1;
+    };
+    
+    // Helper to convert bus index to voltage magnitude state index
+    auto vmag_state_idx = [n_buses](int32_t bus) -> int32_t {
+        return n_buses - 1 + bus;
+    };
+    
+    switch (type) {
+        case MeasurementType::V_MAG: {
+            // dh/dV_i = 1/pt_ratio
+            // The Jacobian has only one non-zero at the voltage magnitude state
+            int32_t state_idx = vmag_state_idx(loc);
+            if (H_col_ind[row_start] == state_idx) {
+                H_values[row_start] = 1.0f / pt;
+            }
+            break;
+        }
+        
+        case MeasurementType::V_ANGLE: {
+            // dh/dtheta_i = 1
+            int32_t state_idx = angle_state_idx(loc);
+            if (state_idx >= 0 && H_col_ind[row_start] == state_idx) {
+                H_values[row_start] = 1.0f;
+            }
+            break;
+        }
+        
+        case MeasurementType::P_INJECTION: {
+            // dP_i/dtheta_j = V_i * V_j * (G_ij * sin(theta_ij) - B_ij * cos(theta_ij))
+            // dP_i/dV_j = V_i * (G_ij * cos(theta_ij) + B_ij * sin(theta_ij))
+            // dP_i/dV_i = 2*V_i*G_ii + sum_j(V_j*(G_ij*cos(theta_ij) + B_ij*sin(theta_ij)))
+            Real Vi = v_mag[loc];
+            Real theta_i = v_angle[loc];
+            Real scale = 1.0f / (pt * ct);
+            
+            int32_t ybus_start = ybus_row_ptr[loc];
+            int32_t ybus_end = ybus_row_ptr[loc + 1];
+            int32_t h_idx = row_start;
+            
+            // Diagonal term for V_i magnitude
+            Real dP_dVi = 0.0f;
+            
+            for (int32_t k = ybus_start; k < ybus_end; ++k) {
+                int32_t j = ybus_col_ind[k];
+                Real Gij = ybus_g[k];
+                Real Bij = ybus_b[k];
+                Real Vj = v_mag[j];
+                Real theta_j = v_angle[j];
+                Real theta_ij = theta_i - theta_j;
+                Real cos_t = cosf(theta_ij);
+                Real sin_t = sinf(theta_ij);
+                
+                if (j == loc) {
+                    // Diagonal: dP_i/dV_i
+                    dP_dVi += 2.0f * Vi * Gij;
+                } else {
+                    // Off-diagonal angle derivative: dP_i/dtheta_j
+                    int32_t angle_idx = angle_state_idx(j);
+                    if (angle_idx >= 0) {
+                        Real dP_dtheta_j = -Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                        // Find position in H_col_ind and write
+                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                            if (H_col_ind[hi] == angle_idx) {
+                                H_values[hi] = dP_dtheta_j * scale;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Off-diagonal voltage derivative: dP_i/dV_j
+                    int32_t vmag_idx = vmag_state_idx(j);
+                    Real dP_dVj = Vi * (Gij * cos_t + Bij * sin_t);
+                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                        if (H_col_ind[hi] == vmag_idx) {
+                            H_values[hi] = dP_dVj * scale;
+                            break;
+                        }
+                    }
+                    
+                    // Accumulate for diagonal V term
+                    dP_dVi += Vj * (Gij * cos_t + Bij * sin_t);
+                }
+                
+                // Diagonal angle derivative: dP_i/dtheta_i
+                if (j != loc) {
+                    int32_t angle_idx_i = angle_state_idx(loc);
+                    if (angle_idx_i >= 0) {
+                        Real dP_dtheta_i = Vi * Vj * (Gij * sin_t - Bij * cos_t);
+                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                            if (H_col_ind[hi] == angle_idx_i) {
+                                H_values[hi] += dP_dtheta_i * scale;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Write diagonal V magnitude derivative
+            int32_t vmag_idx_i = vmag_state_idx(loc);
+            for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                if (H_col_ind[hi] == vmag_idx_i) {
+                    H_values[hi] = dP_dVi * scale;
+                    break;
+                }
+            }
+            break;
+        }
+        
+        case MeasurementType::Q_INJECTION: {
+            // Similar to P_INJECTION but with Q equations
+            Real Vi = v_mag[loc];
+            Real theta_i = v_angle[loc];
+            Real scale = 1.0f / (pt * ct);
+            
+            int32_t ybus_start = ybus_row_ptr[loc];
+            int32_t ybus_end = ybus_row_ptr[loc + 1];
+            
+            Real dQ_dVi = 0.0f;
+            
+            for (int32_t k = ybus_start; k < ybus_end; ++k) {
+                int32_t j = ybus_col_ind[k];
+                Real Gij = ybus_g[k];
+                Real Bij = ybus_b[k];
+                Real Vj = v_mag[j];
+                Real theta_j = v_angle[j];
+                Real theta_ij = theta_i - theta_j;
+                Real cos_t = cosf(theta_ij);
+                Real sin_t = sinf(theta_ij);
+                
+                if (j == loc) {
+                    dQ_dVi += -2.0f * Vi * Bij;
+                } else {
+                    // dQ_i/dtheta_j
+                    int32_t angle_idx = angle_state_idx(j);
+                    if (angle_idx >= 0) {
+                        Real dQ_dtheta_j = -Vi * Vj * (Gij * cos_t + Bij * sin_t);
+                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                            if (H_col_ind[hi] == angle_idx) {
+                                H_values[hi] = dQ_dtheta_j * scale;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // dQ_i/dV_j
+                    int32_t vmag_idx = vmag_state_idx(j);
+                    Real dQ_dVj = Vi * (Gij * sin_t - Bij * cos_t);
+                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                        if (H_col_ind[hi] == vmag_idx) {
+                            H_values[hi] = dQ_dVj * scale;
+                            break;
+                        }
+                    }
+                    
+                    dQ_dVi += Vj * (Gij * sin_t - Bij * cos_t);
+                    
+                    // dQ_i/dtheta_i
+                    int32_t angle_idx_i = angle_state_idx(loc);
+                    if (angle_idx_i >= 0) {
+                        Real dQ_dtheta_i = Vi * Vj * (Gij * cos_t + Bij * sin_t);
+                        for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                            if (H_col_ind[hi] == angle_idx_i) {
+                                H_values[hi] += dQ_dtheta_i * scale;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            int32_t vmag_idx_i = vmag_state_idx(loc);
+            for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                if (H_col_ind[hi] == vmag_idx_i) {
+                    H_values[hi] = dQ_dVi * scale;
+                    break;
+                }
+            }
+            break;
+        }
+        
+        case MeasurementType::P_FLOW:
+        case MeasurementType::Q_FLOW: {
+            // Branch flow derivatives - simpler: only depends on from/to buses
+            int32_t br = loc;  // branch index
+            int32_t i = from_bus[br];
+            int32_t j = to_bus[br];
+            BranchEnd end = branch_end[m];
+            
+            Real Vi = v_mag[i];
+            Real Vj = v_mag[j];
+            Real theta_i = v_angle[i];
+            Real theta_j = v_angle[j];
+            Real g = g_series[br];
+            Real b = b_series[br];
+            Real a = tap_ratio[br];
+            Real phi = phase_shift[br];
+            
+            Real theta_ij = theta_i - theta_j - phi;
+            Real cos_t = cosf(theta_ij);
+            Real sin_t = sinf(theta_ij);
+            Real scale = 1.0f / (pt * ct);
+            Real a2 = a * a;
+            Real inv_a = 1.0f / a;
+            
+            if (type == MeasurementType::P_FLOW) {
+                if (end == BranchEnd::FROM) {
+                    // P_ij at from side
+                    Real dP_dVi = (2.0f * Vi / a2) * g - (Vj * inv_a) * (g * cos_t + b * sin_t);
+                    Real dP_dVj = -(Vi * inv_a) * (g * cos_t + b * sin_t);
+                    Real dP_dtheta_i = (Vi * Vj * inv_a) * (g * sin_t - b * cos_t);
+                    Real dP_dtheta_j = -(Vi * Vj * inv_a) * (g * sin_t - b * cos_t);
+                    
+                    // Write to Jacobian
+                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                        int32_t col = H_col_ind[hi];
+                        if (col == vmag_state_idx(i)) H_values[hi] = dP_dVi * scale;
+                        else if (col == vmag_state_idx(j)) H_values[hi] = dP_dVj * scale;
+                        else if (col == angle_state_idx(i) && angle_state_idx(i) >= 0) 
+                            H_values[hi] = dP_dtheta_i * scale;
+                        else if (col == angle_state_idx(j) && angle_state_idx(j) >= 0) 
+                            H_values[hi] = dP_dtheta_j * scale;
+                    }
+                } else {
+                    // P_ji at to side
+                    Real dP_dVi = -(Vj * inv_a) * (g * cos_t - b * sin_t);
+                    Real dP_dVj = 2.0f * Vj * g - (Vi * inv_a) * (g * cos_t - b * sin_t);
+                    Real dP_dtheta_i = (Vi * Vj * inv_a) * (-g * sin_t - b * cos_t);
+                    Real dP_dtheta_j = -(Vi * Vj * inv_a) * (-g * sin_t - b * cos_t);
+                    
+                    for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                        int32_t col = H_col_ind[hi];
+                        if (col == vmag_state_idx(i)) H_values[hi] = dP_dVi * scale;
+                        else if (col == vmag_state_idx(j)) H_values[hi] = dP_dVj * scale;
+                        else if (col == angle_state_idx(i) && angle_state_idx(i) >= 0) 
+                            H_values[hi] = dP_dtheta_i * scale;
+                        else if (col == angle_state_idx(j) && angle_state_idx(j) >= 0) 
+                            H_values[hi] = dP_dtheta_j * scale;
+                    }
+                }
+            } else {  // Q_FLOW
+                // Similar structure with Q derivatives
+                // Simplified for now - full derivation needed
+                for (int32_t hi = row_start; hi < H_row_ptr[m+1]; ++hi) {
+                    H_values[hi] = 0.0f;  // Placeholder - needs proper Q flow derivatives
+                }
+            }
+            break;
+        }
+        
+        case MeasurementType::P_PSEUDO:
+        case MeasurementType::Q_PSEUDO:
+            // Same as injection but with pseudo (zero) value
+            // Reuse injection logic
+            break;
+            
+        default:
+            break;
+    }
+}
+
 cudaError_t SparseMatrixManager::computeJacobianValues(
     const DeviceMeasurementData& measurements,
     const DeviceBusData& buses,
@@ -923,23 +1564,43 @@ cudaError_t SparseMatrixManager::computeJacobianValues(
     const DeviceYbusMatrix& ybus,
     DeviceCSRMatrix& H)
 {
-    // Suppress unused parameter warnings - placeholder implementation
-    (void)measurements;
-    (void)buses;
-    (void)branches;
-    (void)ybus;
-    (void)H;
+    if (H.nnz == 0 || !ybus.is_valid) {
+        return cudaErrorNotReady;
+    }
     
-    // Compute Jacobian element values based on current state
-    // This reuses the existing sparsity pattern
+    // Zero out H values first
+    cudaMemsetAsync(H.d_values, 0, H.nnz * sizeof(Real), stream_);
     
-    // Launch measurement-type-specific kernels
-    // Each kernel computes partial derivatives for its measurement type
+    dim3 block(BLOCK_SIZE_STANDARD);
+    dim3 grid = compute_grid_size(measurements.count, BLOCK_SIZE_STANDARD);
     
-    // Placeholder - actual implementation requires sorting measurements by type
-    // and launching appropriate kernels
+    computeJacobianValuesKernel<<<grid, block, 0, stream_>>>(
+        H.d_values,
+        H.d_row_ptr,
+        H.d_col_ind,
+        measurements.d_type,
+        measurements.d_location_index,
+        measurements.d_branch_end,
+        measurements.d_pt_ratio,
+        measurements.d_ct_ratio,
+        measurements.d_is_active,
+        buses.d_v_mag,
+        buses.d_v_angle,
+        ybus.d_row_ptr,
+        ybus.d_col_ind,
+        ybus.d_g_values,
+        ybus.d_b_values,
+        branches.d_from_bus,
+        branches.d_to_bus,
+        branches.d_g_series,
+        branches.d_b_series,
+        branches.d_tap_ratio,
+        branches.d_phase_shift,
+        buses.slack_bus_index,
+        buses.count,
+        measurements.count);
     
-    return cudaSuccess;
+    return cudaGetLastError();
 }
 
 //=============================================================================

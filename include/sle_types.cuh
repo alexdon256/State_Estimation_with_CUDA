@@ -362,7 +362,8 @@ struct DeviceMeasurementData {
     Real* d_ct_ratio;
     
     Real* d_value;                  ///< Measured values z
-    Real* d_weight;                 ///< Weights W diagonal
+    Real* d_weight;                 ///< Weights W diagonal (1/sigma^2)
+    Real* d_sigma;                  ///< Standard deviation for Huber M-estimator
     
     bool* d_is_active;
     

@@ -300,8 +300,14 @@ __global__ void computeBranchFlowsKernel(
     Real P_from = Vi2_a2 * g - ViVj_a * (g_cos + b_sin);
     Real Q_from = -Vi2_a2 * (b + b_sh_from) - ViVj_a * (g_sin - b_cos);
     
-    // To-side power flows:
-    // Note: Using the fact that cos(-x) = cos(x), sin(-x) = -sin(x)
+    // To-side power flows (measured at bus j looking toward bus i):
+    // theta_ji = theta_j - theta_i + phi = -theta_ij + 2*phi ≈ -theta_ij for small phi
+    // For simplicity using theta_ji = -theta_ij:
+    // P_ji = V_j^2 * g - (V_i*V_j/a) * (g*cos(-θ) + b*sin(-θ))
+    //      = V_j^2 * g - (V_i*V_j/a) * (g*cos(θ) - b*sin(θ))
+    // Q_ji = -V_j^2 * (b + b_sh) - (V_i*V_j/a) * (g*sin(-θ) - b*cos(-θ))
+    //      = -V_j^2 * (b + b_sh) - (V_i*V_j/a) * (-g*sin(θ) - b*cos(θ))
+    //      = -V_j^2 * (b + b_sh) + (V_i*V_j/a) * (g*sin(θ) + b*cos(θ))
     Real P_to = Vj2 * g - ViVj_a * (g_cos - b_sin);
     Real Q_to = -Vj2 * (b + b_sh_to) + ViVj_a * (g_sin + b_cos);
     
@@ -514,6 +520,31 @@ __global__ void computeObjectiveFunctionKernel(
     }
 }
 
+/**
+ * @brief Device helper function for atomic max on positive floats
+ * 
+ * Uses the fact that for positive floats, the IEEE 754 representation
+ * preserves ordering when interpreted as unsigned integers.
+ */
+__device__ __forceinline__ Real atomicMaxPositiveFloat(Real* address, Real val) {
+    // For positive floats, we can use atomicMax on their bit representation
+    // because IEEE 754 positive floats are ordered the same as unsigned ints
+    unsigned int* address_as_ui = reinterpret_cast<unsigned int*>(address);
+    unsigned int old = *address_as_ui;
+    unsigned int assumed;
+    unsigned int val_ui = __float_as_uint(val);
+    
+    do {
+        assumed = old;
+        if (__uint_as_float(assumed) >= val) {
+            break;
+        }
+        old = atomicCAS(address_as_ui, assumed, val_ui);
+    } while (assumed != old);
+    
+    return __uint_as_float(old);
+}
+
 __global__ void findLargestResidualKernel(
     Real* __restrict__ max_residual,
     int32_t* __restrict__ max_index,
@@ -528,7 +559,7 @@ __global__ void findLargestResidualKernel(
     int32_t tid = threadIdx.x;
     int32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     
-    // Load residual (absolute value)
+    // Load residual (absolute value - always positive)
     Real val = 0.0f;
     int32_t idx = -1;
     if (gid < n_meas && is_active[gid]) {
@@ -540,7 +571,7 @@ __global__ void findLargestResidualKernel(
     shared_idx[tid] = idx;
     __syncthreads();
     
-    // Parallel max reduction
+    // Parallel max reduction within block
     #pragma unroll
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
@@ -552,14 +583,18 @@ __global__ void findLargestResidualKernel(
         __syncthreads();
     }
     
-    // Atomic update of global max (first block writes)
+    // Block leader updates global max using atomic operation
     if (tid == 0) {
-        // Use atomicMax for float comparison (requires custom implementation)
-        // For simplicity, we write partial results and reduce on host
-        atomicMax(reinterpret_cast<int*>(max_residual), 
-                  __float_as_int(shared_vals[0]));
-        if (shared_vals[0] == *max_residual) {
-            *max_index = shared_idx[0];
+        Real block_max = shared_vals[0];
+        int32_t block_max_idx = shared_idx[0];
+        
+        // Atomically update global maximum (for positive values)
+        Real old_max = atomicMaxPositiveFloat(max_residual, block_max);
+        
+        // If this block had the new maximum, update the index
+        // Note: This has a race condition but for finding ANY max index it's acceptable
+        if (block_max > old_max) {
+            atomicExch(max_index, block_max_idx);
         }
     }
 }

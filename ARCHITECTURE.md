@@ -116,7 +116,7 @@ class SLEEngine {
 
 **Responsibilities:**
 - Host-side network element storage
-- String ID to index mapping (using `google::dense_hash_map`)
+- String ID to index mapping (using `std::unordered_map`)
 - Pointer-stable storage (using `boost::stable_vector`)
 - Model validation
 
@@ -137,7 +137,7 @@ class NetworkModel {
 
 **Design Rationale:**
 - `boost::stable_vector`: Guarantees pointer stability (NFR-18)
-- `google::dense_hash_map`: High-performance O(1) lookups (Section 5.2)
+- `std::unordered_map`: O(1) average-case lookups for ID-to-index mapping
 - SoA layout: Optimized for GPU transfer
 
 ### DeviceDataManager Class
@@ -298,7 +298,7 @@ GPU (DeviceBusData)
 
 **Allocation Strategy:**
 - `boost::stable_vector`: Dynamic growth with pointer stability
-- `google::dense_hash_map`: Pre-allocated hash tables
+- `std::unordered_map`: Hash tables with `reserve()` for capacity hints
 - Pinned memory: For async GPU transfers
 
 **Memory Layout:**

@@ -1191,6 +1191,9 @@ cudaError_t DeviceDataManager::allocateMeasurementData(int32_t count) {
     err = cudaMalloc(&measurements_.d_weight, size_real);
     if (err != cudaSuccess) return err;
     
+    err = cudaMalloc(&measurements_.d_sigma, size_real);
+    if (err != cudaSuccess) return err;
+    
     err = cudaMalloc(&measurements_.d_is_active, size_bool);
     if (err != cudaSuccess) return err;
     
@@ -1200,7 +1203,7 @@ cudaError_t DeviceDataManager::allocateMeasurementData(int32_t count) {
     err = cudaMalloc(&measurements_.d_residual, size_real);
     if (err != cudaSuccess) return err;
     
-    total_allocated_ += 6 * size_real + size_int + size_type + size_end + size_bool;
+    total_allocated_ += 7 * size_real + size_int + size_type + size_end + size_bool;
     
     return cudaSuccess;
 }
@@ -1213,6 +1216,7 @@ void DeviceDataManager::freeMeasurementData() {
     if (measurements_.d_ct_ratio) cudaFree(measurements_.d_ct_ratio);
     if (measurements_.d_value) cudaFree(measurements_.d_value);
     if (measurements_.d_weight) cudaFree(measurements_.d_weight);
+    if (measurements_.d_sigma) cudaFree(measurements_.d_sigma);
     if (measurements_.d_is_active) cudaFree(measurements_.d_is_active);
     if (measurements_.d_estimated) cudaFree(measurements_.d_estimated);
     if (measurements_.d_residual) cudaFree(measurements_.d_residual);
@@ -1400,6 +1404,7 @@ cudaError_t DeviceDataManager::upload(const NetworkModel& model) {
     std::vector<Real> h_ct_ratio(n_measurements);
     std::vector<Real> h_value(n_measurements);
     std::vector<Real> h_weight(n_measurements);
+    std::vector<Real> h_sigma(n_measurements);
     // Note: Can't use std::vector<bool> because it's a special template that doesn't have .data()
     std::vector<uint8_t> h_is_active(n_measurements);
     
@@ -1415,6 +1420,7 @@ cudaError_t DeviceDataManager::upload(const NetworkModel& model) {
             h_ct_ratio[i] = meas->descriptor.ct_ratio;
             h_value[i] = meas->value;
             h_weight[i] = meas->weight;
+            h_sigma[i] = meas->descriptor.sigma;
             h_is_active[i] = meas->is_active ? 1 : 0;
             if (meas->is_active) active_count++;
         }
@@ -1447,6 +1453,10 @@ cudaError_t DeviceDataManager::upload(const NetworkModel& model) {
     if (err != cudaSuccess) return err;
     
     err = cudaMemcpyAsync(measurements_.d_weight, h_weight.data(),
+                          n_measurements * sizeof(Real), cudaMemcpyHostToDevice, stream_);
+    if (err != cudaSuccess) return err;
+    
+    err = cudaMemcpyAsync(measurements_.d_sigma, h_sigma.data(),
                           n_measurements * sizeof(Real), cudaMemcpyHostToDevice, stream_);
     if (err != cudaSuccess) return err;
     

@@ -495,13 +495,12 @@ cudaError_t WLSSolver::applyHuberWeights(
     dim3 block(BLOCK_SIZE_STANDARD);
     dim3 grid = compute_grid_size(measurements.count, BLOCK_SIZE_STANDARD);
     
-    // TODO: Need sigma values from measurement data
-    // For now, use weight as proxy (weight = 1/sigma^2)
+    // Use actual sigma values from measurement data for Huber M-estimator
     computeHuberWeightsKernel<<<grid, block, 0, stream_>>>(
         state_->d_huber_weights,
         measurements.d_weight,
         measurements.d_residual,
-        measurements.d_weight,  // Use weight as sigma proxy
+        measurements.d_sigma,  // Proper sigma values
         gamma,
         measurements.d_is_active,
         measurements.count);

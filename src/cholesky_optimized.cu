@@ -379,7 +379,7 @@ cudaError_t OptimizedCholeskySolver::analyzePattern(
 //=============================================================================
 
 cudaError_t OptimizedCholeskySolver::factorize(const Real* d_values) {
-    if (!cache_.is_valid) {
+    if (!cache_.is_valid || current_n_ == 0 || current_nnz_ == 0) {
         return cudaErrorNotReady;
     }
     
@@ -387,23 +387,36 @@ cudaError_t OptimizedCholeskySolver::factorize(const Real* d_values) {
     // The high-level API does analysis + factorization + solve together
     
     // Reallocate cached arrays if needed
-    if (!cached_values_ || current_nnz_ == 0) {
+    bool need_realloc = !cached_values_ || !cached_row_ptr_ || !cached_col_ind_;
+    
+    if (need_realloc) {
         if (cached_values_) cudaFree(cached_values_);
         if (cached_row_ptr_) cudaFree(cached_row_ptr_);
         if (cached_col_ind_) cudaFree(cached_col_ind_);
         
-        cudaMalloc(&cached_values_, current_nnz_ * sizeof(Real));
-        cudaMalloc(&cached_row_ptr_, (current_n_ + 1) * sizeof(int32_t));
-        cudaMalloc(&cached_col_ind_, current_nnz_ * sizeof(int32_t));
+        cudaError_t err;
+        err = cudaMalloc(&cached_values_, current_nnz_ * sizeof(Real));
+        if (err != cudaSuccess) return err;
+        
+        err = cudaMalloc(&cached_row_ptr_, (current_n_ + 1) * sizeof(int32_t));
+        if (err != cudaSuccess) return err;
+        
+        err = cudaMalloc(&cached_col_ind_, current_nnz_ * sizeof(int32_t));
+        if (err != cudaSuccess) return err;
     }
     
-    // Copy matrix data
+    // Copy matrix values (values change each iteration)
     cudaMemcpyAsync(cached_values_, d_values, current_nnz_ * sizeof(Real),
                     cudaMemcpyDeviceToDevice, stream_);
-    cudaMemcpyAsync(cached_row_ptr_, d_reordered_row_ptr_, (current_n_ + 1) * sizeof(int32_t),
-                    cudaMemcpyDeviceToDevice, stream_);
-    cudaMemcpyAsync(cached_col_ind_, d_reordered_col_ind_, current_nnz_ * sizeof(int32_t),
-                    cudaMemcpyDeviceToDevice, stream_);
+    
+    // Copy structure if reordering arrays exist, otherwise the structure was
+    // already set up during analyzePattern
+    if (d_reordered_row_ptr_ && d_reordered_col_ind_) {
+        cudaMemcpyAsync(cached_row_ptr_, d_reordered_row_ptr_, (current_n_ + 1) * sizeof(int32_t),
+                        cudaMemcpyDeviceToDevice, stream_);
+        cudaMemcpyAsync(cached_col_ind_, d_reordered_col_ind_, current_nnz_ * sizeof(int32_t),
+                        cudaMemcpyDeviceToDevice, stream_);
+    }
     
     cudaStreamSynchronize(stream_);
     
