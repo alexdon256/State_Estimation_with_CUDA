@@ -1146,6 +1146,117 @@ SLE_API SLE_Real SLE_CALL sle_GetBranchQ(SLE_Handle handle,
     return engine->getReactivePowerFlow(branch_id, static_cast<BranchEnd>(end));
 }
 
+SLE_API SLE_StatusCode SLE_CALL sle_GetBusResiduals(SLE_Handle handle,
+                                                     const char* bus_id,
+                                                     SLE_Real* v_residual,
+                                                     SLE_Real* p_residual,
+                                                     SLE_Real* q_residual,
+                                                     int32_t* count) {
+    if (!handle || !bus_id) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    const NetworkModel& model = engine->getModel();
+    
+    // Verify bus exists
+    if (model.getBusIndex(bus_id) == INVALID_INDEX) {
+        return SLE_ERROR_ELEMENT_NOT_FOUND;
+    }
+    
+    int32_t found_count = 0;
+    
+    // Initialize outputs to NaN (not found)
+    if (v_residual) *v_residual = std::numeric_limits<SLE_Real>::quiet_NaN();
+    if (p_residual) *p_residual = std::numeric_limits<SLE_Real>::quiet_NaN();
+    if (q_residual) *q_residual = std::numeric_limits<SLE_Real>::quiet_NaN();
+    
+    // Search through all measurements for ones at this bus
+    int32_t n_meas = static_cast<int32_t>(model.getMeasurementCount());
+    for (int32_t i = 0; i < n_meas; ++i) {
+        const MeasurementElement* elem = model.getMeasurement(i);
+        if (!elem || elem->descriptor.location_id != bus_id) continue;
+        
+        switch (elem->descriptor.type) {
+            case MeasurementType::V_MAG:
+                if (v_residual) *v_residual = elem->residual;
+                found_count++;
+                break;
+            case MeasurementType::P_INJECTION:
+            case MeasurementType::P_PSEUDO:
+                if (p_residual) *p_residual = elem->residual;
+                found_count++;
+                break;
+            case MeasurementType::Q_INJECTION:
+            case MeasurementType::Q_PSEUDO:
+                if (q_residual) *q_residual = elem->residual;
+                found_count++;
+                break;
+            default:
+                break;
+        }
+    }
+    
+    if (count) *count = found_count;
+    return SLE_OK;
+}
+
+SLE_API SLE_StatusCode SLE_CALL sle_GetBranchResiduals(SLE_Handle handle,
+                                                        const char* branch_id,
+                                                        SLE_BranchEnd end,
+                                                        SLE_Real* p_residual,
+                                                        SLE_Real* q_residual,
+                                                        SLE_Real* i_residual,
+                                                        int32_t* count) {
+    if (!handle || !branch_id) {
+        return SLE_ERROR_INVALID_ARGUMENT;
+    }
+    
+    SLEEngine* engine = reinterpret_cast<SLEEngine*>(handle);
+    const NetworkModel& model = engine->getModel();
+    
+    // Verify branch exists
+    if (model.getBranchIndex(branch_id) == INVALID_INDEX) {
+        return SLE_ERROR_ELEMENT_NOT_FOUND;
+    }
+    
+    int32_t found_count = 0;
+    BranchEnd target_end = static_cast<BranchEnd>(end);
+    
+    // Initialize outputs to NaN (not found)
+    if (p_residual) *p_residual = std::numeric_limits<SLE_Real>::quiet_NaN();
+    if (q_residual) *q_residual = std::numeric_limits<SLE_Real>::quiet_NaN();
+    if (i_residual) *i_residual = std::numeric_limits<SLE_Real>::quiet_NaN();
+    
+    // Search through all measurements for ones at this branch
+    int32_t n_meas = static_cast<int32_t>(model.getMeasurementCount());
+    for (int32_t i = 0; i < n_meas; ++i) {
+        const MeasurementElement* elem = model.getMeasurement(i);
+        if (!elem || elem->descriptor.location_id != branch_id) continue;
+        if (elem->descriptor.branch_end != target_end) continue;
+        
+        switch (elem->descriptor.type) {
+            case MeasurementType::P_FLOW:
+                if (p_residual) *p_residual = elem->residual;
+                found_count++;
+                break;
+            case MeasurementType::Q_FLOW:
+                if (q_residual) *q_residual = elem->residual;
+                found_count++;
+                break;
+            case MeasurementType::I_MAG:
+                if (i_residual) *i_residual = elem->residual;
+                found_count++;
+                break;
+            default:
+                break;
+        }
+    }
+    
+    if (count) *count = found_count;
+    return SLE_OK;
+}
+
 SLE_API SLE_StatusCode SLE_CALL sle_GetResiduals(SLE_Handle handle,
                                                   SLE_Real* values,
                                                   int32_t count) {

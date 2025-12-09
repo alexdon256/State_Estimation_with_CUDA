@@ -512,19 +512,13 @@ int main() {
     printResult(result1, "Phase 1: Full WLS Run (Precision Mode)");
     printVoltages(engine, bus_count);
     
-    // Show meter estimates after solve
-    std::cout << "\nMeter Estimated Values (after solve):" << std::endl;
-    std::cout << "  VM1 (Bus1) V estimate: ";
-    SLE_Real est_v1;
-    if (sle_GetMeterEstimate(engine, "VM1", "V", &est_v1) == SLE_OK) {
-        std::cout << est_v1 << " p.u." << std::endl;
-    }
-    
-    std::cout << "  MM1-2 (Line1-2) P estimate: ";
-    SLE_Real est_p12;
-    if (sle_GetMeterEstimate(engine, "MM1-2", "kW", &est_p12) == SLE_OK) {
-        std::cout << est_p12 << " p.u." << std::endl;
-    }
+    // Show bus/branch estimates after solve
+    std::cout << "\nEstimated State Values (after solve):" << std::endl;
+    std::cout << "  Bus1 V: " << sle_GetBusVoltage(engine, "Bus1") << " p.u." << std::endl;
+    std::cout << "  Bus1 angle: " << sle_GetBusAngle(engine, "Bus1") << " rad" << std::endl;
+    std::cout << "  Bus2 V: " << sle_GetBusVoltage(engine, "Bus2") << " p.u." << std::endl;
+    std::cout << "  Line1-2 P_from: " << sle_GetBranchP(engine, "Line1-2", SLE_BRANCH_FROM) << " p.u." << std::endl;
+    std::cout << "  Line1-2 Q_from: " << sle_GetBranchQ(engine, "Line1-2", SLE_BRANCH_FROM) << " p.u." << std::endl;
     
     //=========================================================================
     // PHASE 2: Meter Telemetry Update & Fast WLS Run (FR-11, FR-16)
@@ -582,13 +576,36 @@ int main() {
                   << "x" << std::endl;
     }
     
-    // Show residuals from meters
-    std::cout << "\nMeter Residuals:" << std::endl;
-    SLE_Real resid;
-    sle_GetMeterResidual(engine, "VM1", "V", &resid);
-    std::cout << "  VM1 residual: " << resid << std::endl;
-    sle_GetMeterResidual(engine, "MM1-2", "kW", &resid);
-    std::cout << "  MM1-2 P residual: " << resid << std::endl;
+    // Show residuals using the convenient bus/branch residual getters
+    std::cout << "\nResiduals via sle_GetBusResiduals / sle_GetBranchResiduals:" << std::endl;
+    
+    SLE_Real v_res, p_res, q_res, i_res;
+    int32_t res_count;
+    
+    // Get residuals at Bus1
+    if (sle_GetBusResiduals(engine, "Bus1", &v_res, &p_res, &q_res, &res_count) == SLE_OK) {
+        std::cout << "  Bus1: V_resid=" << v_res;
+        if (!std::isnan(p_res)) std::cout << ", P_resid=" << p_res;
+        if (!std::isnan(q_res)) std::cout << ", Q_resid=" << q_res;
+        std::cout << " (" << res_count << " measurements)" << std::endl;
+    }
+    
+    // Get residuals at Bus2
+    if (sle_GetBusResiduals(engine, "Bus2", &v_res, &p_res, &q_res, &res_count) == SLE_OK) {
+        std::cout << "  Bus2: V_resid=" << v_res;
+        if (!std::isnan(p_res)) std::cout << ", P_resid=" << p_res;
+        if (!std::isnan(q_res)) std::cout << ", Q_resid=" << q_res;
+        std::cout << " (" << res_count << " measurements)" << std::endl;
+    }
+    
+    // Get residuals at Line1-2 (from end)
+    if (sle_GetBranchResiduals(engine, "Line1-2", SLE_BRANCH_FROM, &p_res, &q_res, &i_res, &res_count) == SLE_OK) {
+        std::cout << "  Line1-2 FROM:";
+        if (!std::isnan(p_res)) std::cout << " P_resid=" << p_res;
+        if (!std::isnan(q_res)) std::cout << ", Q_resid=" << q_res;
+        if (!std::isnan(i_res)) std::cout << ", I_resid=" << i_res;
+        std::cout << " (" << res_count << " measurements)" << std::endl;
+    }
     
     //=========================================================================
     // PHASE 3: Switching Device Update & Fast Run (FR-05)

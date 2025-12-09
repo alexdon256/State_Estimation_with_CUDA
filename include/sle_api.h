@@ -1219,6 +1219,50 @@ SLE_API SLE_Real SLE_CALL sle_GetBranchQ(SLE_Handle handle,
                                           SLE_BranchEnd end);
 
 /**
+ * @brief Get all measurement residuals for a specific bus
+ * 
+ * Returns residuals for voltage, P injection, and Q injection measurements
+ * associated with the specified bus.
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] bus_id Bus string ID
+ * @param[out] v_residual Voltage magnitude residual (may be NULL)
+ * @param[out] p_residual Active power injection residual (may be NULL)
+ * @param[out] q_residual Reactive power injection residual (may be NULL)
+ * @param[out] count Number of measurements found at this bus (may be NULL)
+ * @return SLE_OK on success, SLE_ERROR_ELEMENT_NOT_FOUND if bus not found
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_GetBusResiduals(SLE_Handle handle,
+                                                     const char* bus_id,
+                                                     SLE_Real* v_residual,
+                                                     SLE_Real* p_residual,
+                                                     SLE_Real* q_residual,
+                                                     int32_t* count);
+
+/**
+ * @brief Get all measurement residuals for a specific branch
+ * 
+ * Returns residuals for P flow, Q flow, and I magnitude measurements
+ * associated with the specified branch at the given end.
+ * 
+ * @param[in] handle Engine handle
+ * @param[in] branch_id Branch string ID
+ * @param[in] end Branch end (FROM or TO)
+ * @param[out] p_residual Active power flow residual (may be NULL)
+ * @param[out] q_residual Reactive power flow residual (may be NULL)
+ * @param[out] i_residual Current magnitude residual (may be NULL)
+ * @param[out] count Number of measurements found at this branch end (may be NULL)
+ * @return SLE_OK on success, SLE_ERROR_ELEMENT_NOT_FOUND if branch not found
+ */
+SLE_API SLE_StatusCode SLE_CALL sle_GetBranchResiduals(SLE_Handle handle,
+                                                        const char* branch_id,
+                                                        SLE_BranchEnd end,
+                                                        SLE_Real* p_residual,
+                                                        SLE_Real* q_residual,
+                                                        SLE_Real* i_residual,
+                                                        int32_t* count);
+
+/**
  * @brief Get measurement residuals (FR-10)
  * 
  * Returns r = z_measured - h(x_estimated) for each measurement.
