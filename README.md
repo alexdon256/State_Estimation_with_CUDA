@@ -1,6 +1,6 @@
 # SLE Engine — GPU-Accelerated Power Grid State Estimator
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 [![CUDA](https://img.shields.io/badge/CUDA-12.6-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://isocpp.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2064--bit-lightgrey.svg)](https://www.microsoft.com/windows)
@@ -233,7 +233,7 @@ SLE/
 ├── SLE.vcxproj                # Visual Studio project
 ├── SRS.md                     # Requirements specification
 ├── BUILD_INSTRUCTIONS.md      # Detailed build guide
-└── LICENSE                    # GPL v3
+└── LICENSE                    # BSD 3-Clause
 ```
 
 ## Configuration
@@ -298,9 +298,9 @@ block_size_standard = 256         # CUDA block size for kernels
 
 ## License
 
-Copyright (C) 2025 Oleksandr Don
+Copyright (c) 2025, Oleksandr Don
 
-This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License v3.0**. See [LICENSE](LICENSE) for details.
+This project is licensed under the **BSD 3-Clause License**. See [LICENSE](LICENSE) for details.
 
 ## References
 
